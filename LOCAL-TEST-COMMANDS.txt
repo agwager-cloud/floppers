@@ -1,0 +1,31 @@
+FOSTER'S FLOPPERS — LOCAL TEST COMMANDS
+
+1. Extract the update zip contents into:
+   C:\Projects\floppers
+
+2. Install and launch:
+
+   cd C:\Projects\floppers
+   npm install
+   npm run dev
+
+3. Host computer browser:
+
+   http://localhost:5173
+
+4. iPad/phone on the same Wi-Fi:
+
+   Run ipconfig on the computer and find its IPv4 address.
+   Example:
+   http://192.168.68.68:5173
+
+5. Server health check:
+
+   http://localhost:2567/health
+
+6. Production build check:
+
+   cd C:\Projects\floppers
+   npm run build
+
+If another device cannot connect, allow Node.js through Windows Defender Firewall on Private networks.

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: fosters-floppers-server
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm ci && npm run build -w server
+    startCommand: npm run start -w server
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_VERSION
+        value: 20.19.5

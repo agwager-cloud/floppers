@@ -1,0 +1,23 @@
+{
+  "name": "fosters-floppers",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n SERVER,CLIENT -c auto \"npm run dev -w server\" \"npm run dev -w client\"",
+    "build": "npm run build -w server && npm run build -w client",
+    "start": "npm run start -w server",
+    "build:server": "npm run build -w server",
+    "build:client": "npm run build -w client",
+    "check": "npm run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

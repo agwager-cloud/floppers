@@ -1,0 +1,33 @@
+FOSTER'S FLOPPERS — WINDOWS INSTALL REPAIR
+
+The original Update 01 package-lock.json accidentally contained private build-system registry URLs.
+This corrected package uses the public npm registry.
+
+1. Close any terminal currently running the game.
+2. Open PowerShell.
+3. Run:
+
+cd C:\Projects\floppers
+Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force
+cmd /c "rmdir /s /q node_modules" 2>$null
+Remove-Item package-lock.json -Force -ErrorAction SilentlyContinue
+
+4. Extract the contents of fosters-floppers-update-01a-install-fix.zip into
+   C:\Projects\floppers and choose Replace All.
+
+5. Then run:
+
+cd C:\Projects\floppers
+npm install
+npm run dev
+
+6. Open on the PC:
+
+http://localhost:5173
+
+7. Open on another device connected to the same home network:
+
+http://192.168.68.68:5173
+
+The local WebSocket server runs on port 2567.
+Health check: http://localhost:2567/health
