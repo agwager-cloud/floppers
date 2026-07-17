@@ -61,6 +61,7 @@ export class FreeThrowScene extends Phaser.Scene {
   private distractionUseSignature = '';
   private keyboardShoot?: Phaser.Input.Keyboard.Key;
   private restartQueued = false;
+  private resultAudioFinished = true;
 
   constructor() {
     super('FreeThrowScene');
@@ -72,6 +73,7 @@ export class FreeThrowScene extends Phaser.Scene {
     // to stop refreshing after a bot's first free throw.
     this.cleanups = [];
     this.restartQueued = false;
+    this.resultAudioFinished = true;
     this.animationPlaying = false;
     this.pendingRefresh = false;
     this.pendingRouteRoom = undefined;
@@ -385,7 +387,10 @@ export class FreeThrowScene extends Phaser.Scene {
     const match = room.matches.find((candidate) => candidate.id === this.matchId);
 
     if (!match || match.phase !== 'FREE_THROW' || room.status !== 'ACTIVE') {
-      if (this.animationPlaying) this.pendingRouteRoom = room;
+      // Do not enter the next flop scene until both the ball-flight animation
+      // and the free-throw commentary audio have completed. This prevents the
+      // result call and the next flop commentary from playing at the same time.
+      if (this.animationPlaying || !this.resultAudioFinished) this.pendingRouteRoom = room;
       else this.safeRoute(room);
       return;
     }
@@ -398,7 +403,7 @@ export class FreeThrowScene extends Phaser.Scene {
     const roleChanged = match.activeShooterId !== this.shooterId;
     const defenderControlsChanged = defenderId === gameSession.playerId && nextDistractionUse !== this.distractionUseSignature;
 
-    if (!this.animationPlaying && !match.shotInFlight && (turnChanged || roleChanged || defenderControlsChanged)) {
+    if (!this.animationPlaying && !match.shotInFlight && (turnChanged || roleChanged)) {
       this.queueRestart();
       return;
     }
@@ -407,6 +412,20 @@ export class FreeThrowScene extends Phaser.Scene {
     this.turnId = nextTurnId;
     this.distractionUseSignature = nextDistractionUse;
     this.localDistractionUsed = nextDistractionUse === gameSession.playerId;
+
+    // Do not restart the defender's scene when their distraction is accepted.
+    // Restarting previously destroyed the camera shake before the distracting
+    // player could see it. Instead, update the controls in place.
+    if (defenderControlsChanged && this.localDistractionUsed) {
+      this.distractionButtons.forEach((button) => {
+        button.setAlpha(0.42);
+        const background = button.list[0] as Phaser.GameObjects.Rectangle | undefined;
+        background?.disableInteractive();
+      });
+      this.distractionStatusText
+        ?.setText('DISTRACTION USED FOR THIS SHOT')
+        .setColor('#67f2a8');
+    }
 
     this.attemptsText?.setText(this.attemptLabel(match));
     this.refreshScoreCards(match, room);
@@ -424,7 +443,8 @@ export class FreeThrowScene extends Phaser.Scene {
             : 'basketballs hidden for 3 seconds';
         showToast(this, `${defender?.name ?? 'The defender'} used ${match.distraction.type} — ${effect}!`, COLORS.orange);
 
-        if (match.distraction.type === 'BAD DANCE' && match.activeShooterId === gameSession.playerId) {
+        const localPlayerIsInMatch = match.playerAId === gameSession.playerId || match.playerBId === gameSession.playerId;
+        if (match.distraction.type === 'BAD DANCE' && localPlayerIsInMatch) {
           const startDelay = Math.max(0, (match.distraction.startedAt ?? Date.now()) - Date.now());
           const duration = Math.max(500, (match.distraction.expiresAt ?? Date.now() + 500) - Math.max(Date.now(), match.distraction.startedAt ?? Date.now()));
           this.time.delayedCall(startDelay, () => {
@@ -658,6 +678,7 @@ export class FreeThrowScene extends Phaser.Scene {
           const latestRoom = gameSession.room;
           const latestMatch = latestRoom?.matches.find((candidate) => candidate.id === this.matchId);
           if (this.pendingRouteRoom) {
+            if (!this.resultAudioFinished) return;
             const nextRoom = this.pendingRouteRoom;
             this.pendingRouteRoom = undefined;
             this.safeRoute(nextRoom);
@@ -674,7 +695,14 @@ export class FreeThrowScene extends Phaser.Scene {
   }
 
   private showShotResult(made: boolean, resultAudioKey?: string): void {
-    playFreeThrowResult(this, made, resultAudioKey);
+    this.resultAudioFinished = false;
+    playFreeThrowResult(this, made, resultAudioKey, () => {
+      this.resultAudioFinished = true;
+      if (!this.scene.isActive() || !this.pendingRouteRoom || this.animationPlaying) return;
+      const nextRoom = this.pendingRouteRoom;
+      this.pendingRouteRoom = undefined;
+      this.safeRoute(nextRoom);
+    });
     this.resultText?.setText(made ? 'SWISH! +1' : 'CLANG! MISSED').setColor(made ? '#67f2a8' : '#ff7182').setAlpha(1).setScale(0.65);
     this.tweens.add({ targets: this.resultText, scale: 1.16, alpha: 0, duration: 1050, ease: 'Back.Out' });
     const flash = this.add.circle(640, 218, made ? 55 : 38, made ? COLORS.green : COLORS.red, 0.36).setDepth(105);

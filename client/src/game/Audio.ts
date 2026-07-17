@@ -173,7 +173,6 @@ export function playFlopCommentary(
   requestedKey: string | undefined,
   onFinished: () => void,
 ): string | undefined {
-  if (activeCommentary?.isPlaying) activeCommentary.stop();
   const requested = requestedKey && requestedKey !== lastFlopKey
     ? FLOP_AUDIO.find((item) => item.key === requestedKey)
     : undefined;
@@ -183,10 +182,35 @@ export function playFlopCommentary(
     return undefined;
   }
   lastFlopKey = definition.key;
-  activeCommentary = playVoice(scene, definition.key, COMMENTARY_VOLUME, () => {
-    activeCommentary = undefined;
-    onFinished();
-  });
+
+  const startCommentary = () => {
+    if (!scene.scene.isActive()) {
+      onFinished();
+      return;
+    }
+    if (activeCommentary?.isPlaying) activeCommentary.stop();
+    activeCommentary = playVoice(scene, definition.key, COMMENTARY_VOLUME, () => {
+      activeCommentary = undefined;
+      onFinished();
+    });
+  };
+
+  // A long free-throw result call can still be finishing when the server moves
+  // into the next flop. Poll until it is complete rather than allowing two
+  // commentary recordings to play over one another.
+  const waitForResultAudio = () => {
+    if (!scene.scene.isActive()) {
+      onFinished();
+      return;
+    }
+    if (activeResult?.isPlaying) {
+      scene.time.delayedCall(80, waitForResultAudio);
+      return;
+    }
+    startCommentary();
+  };
+
+  waitForResultAudio();
   return definition.key;
 }
 
@@ -228,7 +252,12 @@ export function playCrowd(scene: Phaser.Scene): void {
   });
 }
 
-export function playFreeThrowResult(scene: Phaser.Scene, made: boolean, requestedKey?: string): string | undefined {
+export function playFreeThrowResult(
+  scene: Phaser.Scene,
+  made: boolean,
+  requestedKey?: string,
+  onFinished?: () => void,
+): string | undefined {
   if (activeResult?.isPlaying) activeResult.stop();
   const definitions = made ? FREE_THROW_MADE_AUDIO : FREE_THROW_MISS_AUDIO;
   const previous = made ? lastMadeKey : lastMissKey;
@@ -238,6 +267,7 @@ export function playFreeThrowResult(scene: Phaser.Scene, made: boolean, requeste
   const definition = requested ?? chooseDifferent(definitions, previous);
   if (!definition) {
     if (made) playCrowd(scene);
+    onFinished?.();
     return undefined;
   }
 
@@ -246,6 +276,7 @@ export function playFreeThrowResult(scene: Phaser.Scene, made: boolean, requeste
 
   activeResult = playVoice(scene, definition.key, RESULT_VOLUME, () => {
     activeResult = undefined;
+    onFinished?.();
   });
   if (made) playCrowd(scene);
   return definition.key;

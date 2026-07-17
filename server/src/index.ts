@@ -655,7 +655,16 @@ function resolveShot(room: Room, match: Match, direction: number, power: number)
   broadcast(room);
 
   // Keep the scene stable long enough for every client to watch the ball fly.
-  schedule(room, match, 2200, () => finishResolvedShot(room, match));
+  // When this shot will hand control to a player who has not flopped yet, the
+  // next scene is another Flop Scene. Give the longest current free-throw
+  // commentary clip time to finish first so two commentary files never overlap.
+  const nextShooterId = match.activeShooterId === match.playerAId ? match.playerBId : match.playerAId;
+  const matchAlreadyWon = Boolean(determineWinner(match));
+  const nextSceneIsFlop = !matchAlreadyWon
+    && match.attemptsRemaining === 0
+    && !match.floppedPlayerIds.includes(nextShooterId);
+  const finishDelay = nextSceneIsFlop ? 6200 : 2200;
+  schedule(room, match, finishDelay, () => finishResolvedShot(room, match));
 }
 
 function finishResolvedShot(room: Room, match: Match): void {
