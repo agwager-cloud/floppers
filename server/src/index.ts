@@ -13,7 +13,7 @@ const GREEN_SUCCESS_HALF_WIDTHS = [BASE_GREEN_HALF_WIDTH, 0.115, 0.095, 0.078, 0
 const SHOT_CLOCK_MS = 10_000;
 const DISTRACTION_WINDOW_MS = 6_000;
 const DISTRACTION_DELAY_MS = 250;
-const DISTRACTION_EFFECT_MS = 1_500;
+const DISTRACTION_EFFECT_MS = 3_000;
 const MATCH_WATCHDOG_INTERVAL_MS = 500;
 const FREE_THROW_WATCHDOG_GRACE_MS = 1_200;
 const SHOT_FLIGHT_WATCHDOG_GRACE_MS = 3_200;
@@ -23,7 +23,7 @@ const VALID_SIZES = new Set([2, 4, 8, 16, 32]);
 // Coprime half-cycle pairs make the two markers travel at visibly different
 // speeds while guaranteeing that they meet in the centre only at the two
 // deliberately scheduled perfect-shot windows.
-const METER_SPEED_PROFILES = [[1, 2], [2, 3], [3, 4]] as const;
+const METER_SPEED_PROFILES = [[1, 2], [1, 3], [1, 4], [2, 3], [2, 5], [3, 4], [3, 5], [4, 5]] as const;
 
 const CHARACTER_IDS = [
   'luka-donut', 'shai-gorgeous', 'wemby-long', 'joke-itch', 'cade-cupcake', 'steph-currywurst',
@@ -156,7 +156,7 @@ interface Match {
   flopAudioKey: string;
   lastMadeAudioKey?: string;
   lastMissAudioKey?: string;
-  distraction?: { type: string; byPlayerId: string; startedAt: number; expiresAt: number };
+  distraction?: { type: string; mode?: 'DIRECTION' | 'POWER' | 'BOTH'; byPlayerId: string; startedAt: number; expiresAt: number };
   distractionUsedByPlayerId?: string;
   lastDistractionAt?: number;
   shotInFlight: boolean;
@@ -715,6 +715,7 @@ function handleDistraction(room: Room, player: Player, matchId: string, rawType:
   match.distractionUsedByPlayerId = player.id;
   match.distraction = {
     type: cleanType,
+    mode: cleanType === 'FOAM FINGER' ? randomChoice(['DIRECTION', 'POWER', 'BOTH'] as const) : undefined,
     byPlayerId: player.id,
     startedAt: now + DISTRACTION_DELAY_MS,
     expiresAt: now + DISTRACTION_DELAY_MS + DISTRACTION_EFFECT_MS,
@@ -735,8 +736,10 @@ function maybeAutomatedDefenderDistracts(room: Room, match: Match, turnId: strin
     const now = Date.now();
     if (now >= (match.distractionWindowClosesAt ?? 0)) return;
     match.distractionUsedByPlayerId = defenderId;
+    const type = randomChoice(['FOAM FINGER', 'BAD DANCE', 'SQUEAKY SHOES'] as const);
     match.distraction = {
-      type: randomChoice(['FOAM FINGER', 'BAD DANCE', 'SQUEAKY SHOES']),
+      type,
+      mode: type === 'FOAM FINGER' ? randomChoice(['DIRECTION', 'POWER', 'BOTH'] as const) : undefined,
       byPlayerId: defenderId,
       startedAt: now + DISTRACTION_DELAY_MS,
       expiresAt: now + DISTRACTION_DELAY_MS + DISTRACTION_EFFECT_MS,
@@ -907,17 +910,22 @@ function isAutomated(room: Room, playerId: string): boolean {
 }
 
 function assignMeterProfile(match: Match, now: number): void {
-  const firstDelay = randomBetween(2650, 3350);
-  const secondDelay = randomBetween(8050, 8700);
+  // Give every turn two guaranteed centre overlaps, but spread them across a
+  // much wider range so the timing does not always feel like "7-8 seconds"
+  // then "2-3 seconds" remaining. The second chance is always after the
+  // distraction window has closed.
+  const firstDelay = randomBetween(1400, 4600);
+  const secondDelay = Math.max(firstDelay + randomBetween(2500, 4300), randomBetween(6500, 9200));
   const selected = randomChoice(METER_SPEED_PROFILES);
   const swap = Math.random() < 0.5;
   match.meterFirstPerfectAt = now + firstDelay;
-  match.meterSecondPerfectAt = now + Math.max(secondDelay, firstDelay + 4600);
+  match.meterSecondPerfectAt = now + Math.min(9300, Math.max(secondDelay, firstDelay + 2400));
   match.meterDirectionHalfCycles = swap ? selected[1] : selected[0];
   match.meterPowerHalfCycles = swap ? selected[0] : selected[1];
   match.meterDirectionSign = Math.random() < 0.5 ? -1 : 1;
   match.meterPowerSign = Math.random() < 0.5 ? -1 : 1;
 }
+
 
 function calculateMeterValues(match: Match, at: number): { direction: number; power: number } {
   const firstPerfectAt = match.meterFirstPerfectAt;
@@ -952,13 +960,12 @@ function calculateMeterValues(match: Match, at: number): { direction: number; po
     const fadeOut = Math.min(1, (distraction.expiresAt - at) / 360);
     const strength = fadeIn * fadeOut;
     if (distraction.type === 'FOAM FINGER') {
-      direction += Math.sin(effectElapsed * 0.021) * 0.12 * strength;
-    } else if (distraction.type === 'BAD DANCE') {
-      power += Math.sin(effectElapsed * 0.018 + 1.1) * 0.12 * strength;
-    } else if (distraction.type === 'SQUEAKY SHOES') {
-      const pulse = Math.sin(effectElapsed * 0.028) * 0.07 * strength;
-      direction += pulse;
-      power -= pulse * 0.85;
+      const sway = Math.sin(effectElapsed * 0.022) * 0.12 * strength;
+      if (distraction.mode === 'POWER') power += sway;
+      else if (distraction.mode === 'BOTH') {
+        direction += sway;
+        power -= sway * 0.9;
+      } else direction += sway;
     }
   }
 

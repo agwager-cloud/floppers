@@ -32,13 +32,13 @@ export class StartScene extends Phaser.Scene {
 
     // Compact single-row control bar positioned in the clear arena-light area
     // beneath the game title and above every background player.
-    this.add.rectangle(668 + 4, 248 + 4, 480, 42, 0x000000, 0.24);
-    this.add.rectangle(668, 248, 480, 42, 0x10183f, 0.7)
+    this.add.rectangle(688 + 4, 248 + 4, 480, 42, 0x000000, 0.24);
+    this.add.rectangle(688, 248, 480, 42, 0x10183f, 0.7)
       .setStrokeStyle(2, 0x6f7eff, 0.9);
 
     this.nameInput = new CanvasTextInput(this, {
       id: 'playerName',
-      x: 510,
+      x: 530,
       y: 248,
       width: 142,
       height: 30,
@@ -47,14 +47,14 @@ export class StartScene extends Phaser.Scene {
       onInput: (value) => value.replace(/[^A-Za-z0-9 '\-_.]/g, '').slice(0, 18),
     });
 
-    this.hostButton = addButton(this, 625, 248, 74, 30, 'HOST', () => this.hostGame(), {
+    this.hostButton = addButton(this, 645, 248, 74, 30, 'HOST', () => this.hostGame(), {
       fill: COLORS.gold,
       fontSize: 12,
     });
 
     this.codeInput = new CanvasTextInput(this, {
       id: 'roomCode',
-      x: 740,
+      x: 760,
       y: 248,
       width: 112,
       height: 30,
@@ -64,14 +64,14 @@ export class StartScene extends Phaser.Scene {
       onInput: (value) => value.replace(/\D/g, '').slice(0, 5),
     });
 
-    this.joinButton = addButton(this, 848, 248, 74, 30, 'JOIN', () => this.joinGame(), {
+    this.joinButton = addButton(this, 868, 248, 74, 30, 'JOIN', () => this.joinGame(), {
       fill: COLORS.blue,
       fontSize: 12,
     });
 
     addSoundToggle(this);
 
-    this.serverStatusText = this.add.text(668, 282, '', {
+    this.serverStatusText = this.add.text(688, 282, '', {
       fontFamily: 'Arial Black, Arial',
       fontSize: '14px',
       color: '#ffe56f',

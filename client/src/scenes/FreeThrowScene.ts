@@ -158,16 +158,31 @@ export class FreeThrowScene extends Phaser.Scene {
   }
 
   update(): void {
-    const match = gameSession.room?.matches.find((candidate) => candidate.id === this.matchId);
-    if (!match || !this.directionBall || !this.powerBall) return;
+    const room = gameSession.room;
+    const match = room?.matches.find((candidate) => candidate.id === this.matchId);
+    if (!room || !match || !this.directionBall || !this.powerBall) return;
+
+    const shooter = room.players.find((player) => player.id === match.activeShooterId);
+    const shooterIsAutomated = !shooter || shooter.isBot || !shooter.connected;
 
     if (!match.shotInFlight && !this.shotLocked) {
-      const values = this.calculateMeterValues(match, Date.now());
-      this.directionValue = values.direction;
-      this.powerValue = values.power;
+      // When a bot reaches its scheduled release moment, freeze the markers at
+      // that exact server-authoritative point so the shot looks smooth instead
+      // of jumping from a miss into the green zone when the network update lands.
+      if (shooterIsAutomated && match.turnReadyAt && Date.now() >= match.turnReadyAt) {
+        const values = this.calculateMeterValues(match, match.turnReadyAt);
+        this.directionValue = values.direction;
+        this.powerValue = values.power;
+        this.shotLocked = true;
+      } else {
+        const values = this.calculateMeterValues(match, Date.now());
+        this.directionValue = values.direction;
+        this.powerValue = values.power;
+      }
       this.positionMeterBalls();
     }
 
+    this.updateDistractionVisuals(match);
     this.updateShotClock(match);
     this.updateDistractionWindow(match);
   }
@@ -290,13 +305,13 @@ export class FreeThrowScene extends Phaser.Scene {
       }).setOrigin(0.5);
 
       this.distractionButtons = [
-        addButton(this, 190, 466, 245, 38, 'FOAM FINGER — DIRECTION', () => this.distract('FOAM FINGER'), {
+        addButton(this, 190, 466, 245, 38, 'FOAM FINGER — RANDOM', () => this.distract('FOAM FINGER'), {
           fill: COLORS.blue, fontSize: 11, disabled: distractionDisabled,
         }),
-        addButton(this, 190, 514, 245, 38, 'BAD DANCE — POWER', () => this.distract('BAD DANCE'), {
+        addButton(this, 190, 514, 245, 38, 'BAD DANCE — SHAKE', () => this.distract('BAD DANCE'), {
           fill: COLORS.orange, fontSize: 11, disabled: distractionDisabled,
         }),
-        addButton(this, 190, 562, 245, 38, 'SQUEAK SHOES — BOTH', () => this.distract('SQUEAKY SHOES'), {
+        addButton(this, 190, 562, 245, 38, 'SQUEAK SHOES — HIDE BALLS', () => this.distract('SQUEAKY SHOES'), {
           fill: COLORS.red, fontSize: 11, disabled: distractionDisabled,
         }),
       ];
@@ -403,11 +418,19 @@ export class FreeThrowScene extends Phaser.Scene {
         this.lastDistractionSignature = signature;
         const defender = room.players.find((player) => player.id === match.distraction?.byPlayerId);
         const effect = match.distraction.type === 'FOAM FINGER'
-          ? 'a brief direction wobble is incoming'
+          ? `random meter jam — ${(match.distraction.mode ?? 'DIRECTION').toLowerCase()} affected`
           : match.distraction.type === 'BAD DANCE'
-            ? 'a brief power wobble is incoming'
-            : 'both basketballs will briefly sway';
+            ? 'screen shake for 3 seconds'
+            : 'basketballs hidden for 3 seconds';
         showToast(this, `${defender?.name ?? 'The defender'} used ${match.distraction.type} — ${effect}!`, COLORS.orange);
+
+        if (match.distraction.type === 'BAD DANCE' && match.activeShooterId === gameSession.playerId) {
+          const startDelay = Math.max(0, (match.distraction.startedAt ?? Date.now()) - Date.now());
+          const duration = Math.max(500, (match.distraction.expiresAt ?? Date.now() + 500) - Math.max(Date.now(), match.distraction.startedAt ?? Date.now()));
+          this.time.delayedCall(startDelay, () => {
+            if (this.scene.isActive()) this.cameras.main.shake(duration, 0.0038, true);
+          });
+        }
       }
     }
 
@@ -439,7 +462,7 @@ export class FreeThrowScene extends Phaser.Scene {
     this.tweens.add({
       targets: progress,
       value: 1,
-      duration: 110,
+      duration: 90,
       ease: 'Sine.Out',
       onUpdate: () => {
         this.directionValue = Phaser.Math.Linear(fromDirection, direction, progress.value);
@@ -491,13 +514,12 @@ export class FreeThrowScene extends Phaser.Scene {
       const fadeOut = Math.min(1, (distraction.expiresAt - at) / 360);
       const strength = fadeIn * fadeOut;
       if (distraction.type === 'FOAM FINGER') {
-        direction += Math.sin(effectElapsed * 0.021) * 0.12 * strength;
-      } else if (distraction.type === 'BAD DANCE') {
-        power += Math.sin(effectElapsed * 0.018 + 1.1) * 0.12 * strength;
-      } else if (distraction.type === 'SQUEAKY SHOES') {
-        const pulse = Math.sin(effectElapsed * 0.028) * 0.07 * strength;
-        direction += pulse;
-        power -= pulse * 0.85;
+        const sway = Math.sin(effectElapsed * 0.022) * 0.12 * strength;
+        if (distraction.mode === 'POWER') power += sway;
+        else if (distraction.mode === 'BOTH') {
+          direction += sway;
+          power -= sway * 0.9;
+        } else direction += sway;
       }
     }
 
@@ -505,6 +527,19 @@ export class FreeThrowScene extends Phaser.Scene {
       direction: Phaser.Math.Clamp(direction, 0, 1),
       power: Phaser.Math.Clamp(power, 0, 1),
     };
+  }
+
+  private updateDistractionVisuals(match: MatchState): void {
+    if (!this.directionBall || !this.powerBall) return;
+    const distraction = match.distraction;
+    const active = distraction && Date.now() >= distraction.startedAt && distraction.expiresAt > Date.now();
+    if (active && distraction.type === 'SQUEAKY SHOES') {
+      this.directionBall.setAlpha(0);
+      this.powerBall.setAlpha(0);
+    } else {
+      this.directionBall.setAlpha(1);
+      this.powerBall.setAlpha(1);
+    }
   }
 
   private updateDistractionWindow(match: MatchState): void {

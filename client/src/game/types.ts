@@ -61,6 +61,7 @@ export interface MatchState {
   flopAudioKey?: string;
   distraction?: {
     type: string;
+    mode?: 'DIRECTION' | 'POWER' | 'BOTH';
     byPlayerId: string;
     startedAt: number;
     expiresAt: number;

@@ -194,31 +194,32 @@ export function createBasketball(
   y: number,
   radius = 16,
 ): Phaser.GameObjects.Container {
-  const seamWidth = Math.max(1.5, radius * 0.1);
-  const ball = scene.add.circle(0, 0, radius, 0xf47a22)
-    .setStrokeStyle(Math.max(2, radius * 0.12), 0x321407, 1);
+  const outline = Math.max(1.8, radius * 0.12);
+  const seamWidth = Math.max(1.5, radius * 0.105);
 
-  // Draw every seam with one local Graphics object. The old Phaser Line game
-  // object could leave a stray segment extending left of the meter marker on
-  // iPad. These bounded seams stay completely inside the basketball.
+  const shadow = scene.add.ellipse(radius * 0.1, radius * 0.12, radius * 1.7, radius * 1.45, 0x6d3110, 0.26);
+  const base = scene.add.circle(0, 0, radius, 0xc97534).setStrokeStyle(outline, 0x4a1f08, 1);
+  const lowerShade = scene.add.circle(radius * 0.18, radius * 0.22, radius * 0.9, 0xa95824, 0.45);
+  const warmGlow = scene.add.circle(-radius * 0.18, -radius * 0.22, radius * 0.82, 0xe9a86a, 0.44);
+  const highlight = scene.add.ellipse(-radius * 0.3, -radius * 0.42, radius * 0.78, radius * 0.42, 0xffe3bd, 0.24).setAngle(-28);
+
   const seams = scene.add.graphics();
-  seams.lineStyle(seamWidth, 0x321407, 1);
-  seams.lineBetween(-radius * 0.86, 0, radius * 0.86, 0);
+  seams.lineStyle(seamWidth, 0x2e1306, 1);
+  seams.lineBetween(-radius * 0.88, 0, radius * 0.88, 0);
 
   seams.beginPath();
-  seams.moveTo(0, -radius * 0.87);
-  seams.lineTo(0, radius * 0.87);
+  seams.arc(-radius * 0.8, 0, radius * 0.92, -0.82, 0.82, false);
   seams.strokePath();
 
   seams.beginPath();
-  seams.arc(-radius * 0.63, 0, radius * 0.82, -0.9, 0.9, false);
+  seams.arc(radius * 0.48, 0, radius * 0.95, Math.PI - 1.06, Math.PI + 1.06, false);
   seams.strokePath();
 
   seams.beginPath();
-  seams.arc(radius * 0.63, 0, radius * 0.82, Math.PI - 0.9, Math.PI + 0.9, false);
+  seams.arc(radius * 0.16, 0, radius * 0.9, -1.16, 1.16, false);
   seams.strokePath();
 
-  return scene.add.container(x, y, [ball, seams]);
+  return scene.add.container(x, y, [shadow, base, lowerShade, warmGlow, highlight, seams]);
 }
 
 export function createPlayerPortrait(
