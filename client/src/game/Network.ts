@@ -17,6 +17,7 @@ class NetworkService {
   private errorListeners = new Set<ErrorListener>();
   private welcomeListeners = new Set<WelcomeListener>();
   private connectionStatusListeners = new Set<ConnectionStatusListener>();
+  private reconnecting = false;
 
   connect(): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN) return Promise.resolve();
@@ -74,7 +75,7 @@ class NetworkService {
 
     this.emitConnectionStatus(
       isRemoteSecureServer
-        ? 'WAKING GAME SERVER • THIS CAN TAKE UP TO 60 SECONDS'
+        ? 'CONNECTING TO GAME SERVER • THIS CAN TAKE UP TO 60 SECONDS'
         : 'CONNECTING TO LOCAL GAME SERVER…',
     );
 
@@ -89,7 +90,13 @@ class NetworkService {
     while (Date.now() < deadline) {
       attempt += 1;
       this.emitConnectionStatus(
-        attempt === 1 ? 'CONNECTING TO GAME SERVER…' : `SERVER IS WAKING • RETRYING (${attempt})…`,
+        isRemoteSecureServer
+          ? attempt === 1
+            ? 'CONNECTING TO GAME SERVER • THIS CAN TAKE UP TO 60 SECONDS'
+            : `SERVER MAY BE WAKING • RETRY ${attempt} • UP TO 60 SECONDS`
+          : attempt === 1
+            ? 'CONNECTING TO LOCAL GAME SERVER…'
+            : `RETRYING LOCAL SERVER (${attempt})…`,
       );
 
       try {
@@ -173,19 +180,54 @@ class NetworkService {
     socket.addEventListener('close', () => {
       if (this.socket !== socket) return;
       this.socket = null;
-      this.emitConnectionStatus('');
-      this.emitError('Connection to the game server was lost. Refresh to reconnect.');
+      const canResume = Boolean(gameSession.playerId && gameSession.room?.code);
+      if (!canResume) {
+        this.emitConnectionStatus('');
+        this.emitError('Connection to the game server was lost.');
+        return;
+      }
+
+      this.emitConnectionStatus('CONNECTION INTERRUPTED • RECONNECTING AUTOMATICALLY…');
+      this.emitError('Connection interrupted — reconnecting automatically…');
+      void this.resumeSession();
     });
     socket.addEventListener('error', () => {
       if (this.socket !== socket) return;
-      this.emitError('The game server connection encountered an error.');
+      // Most browsers emit an error immediately before close. The close handler
+      // performs the reconnect, so avoid displaying a second alarming message.
+      this.emitConnectionStatus('CONNECTION INTERRUPTED • RECONNECTING AUTOMATICALLY…');
     });
+  }
+
+  private async resumeSession(): Promise<void> {
+    if (this.reconnecting) return;
+    const playerId = gameSession.playerId;
+    const code = gameSession.room?.code;
+    if (!playerId || !code) return;
+
+    this.reconnecting = true;
+    try {
+      await this.connect();
+      if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+        throw new Error('The reconnected socket is not ready.');
+      }
+      this.emitConnectionStatus('REJOINING YOUR ROOM…');
+      this.socket.send(JSON.stringify({ type: 'RESUME_SESSION', playerId, code } satisfies ClientMessage));
+    } catch (error) {
+      this.emitConnectionStatus('');
+      this.emitError(error instanceof Error
+        ? `Automatic reconnect failed: ${error.message}`
+        : 'Automatic reconnect failed. Refresh the page to rejoin.');
+      this.reconnecting = false;
+    }
   }
 
   private handleMessage(raw: unknown): void {
     try {
       const message = JSON.parse(String(raw)) as ServerMessage;
       if (message.type === 'WELCOME') {
+        this.reconnecting = false;
+        this.emitConnectionStatus('');
         gameSession.playerId = message.playerId;
         gameSession.room = message.room;
         this.welcomeListeners.forEach((listener) => listener());

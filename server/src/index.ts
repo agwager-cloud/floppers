@@ -14,6 +14,9 @@ const SHOT_CLOCK_MS = 10_000;
 const DISTRACTION_WINDOW_MS = 6_000;
 const DISTRACTION_DELAY_MS = 250;
 const DISTRACTION_EFFECT_MS = 1_500;
+const MATCH_WATCHDOG_INTERVAL_MS = 500;
+const FREE_THROW_WATCHDOG_GRACE_MS = 1_200;
+const SHOT_FLIGHT_WATCHDOG_GRACE_MS = 3_200;
 const HUMAN_FLOP_SCENE_MS = 7_200;
 const AUTOMATED_FLOP_SCENE_MS = 5_800;
 const VALID_SIZES = new Set([2, 4, 8, 16, 32]);
@@ -170,6 +173,8 @@ interface Match {
   meterDirectionSign?: number;
   meterPowerSign?: number;
   autoShotScheduled?: boolean;
+  phaseDeadlineAt?: number;
+  completedAt?: number;
   floppedPlayerIds: string[];
 }
 
@@ -182,11 +187,13 @@ interface Room {
   matches: Match[];
   currentRoundMatchIds: string[];
   finalWinnerId?: string;
+  roundAdvanceAt?: number;
 }
 
 type ClientMessage =
   | { type: 'HOST_ROOM'; name: string }
   | { type: 'JOIN_ROOM'; name: string; code: string }
+  | { type: 'RESUME_SESSION'; playerId: string; code: string }
   | { type: 'SELECT_CHARACTER'; characterId: string }
   | { type: 'SET_TOURNAMENT_SIZE'; size: number }
   | { type: 'CREATE_TOURNAMENT' }
@@ -241,7 +248,11 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`Foster's Floppers server listening on http://0.0.0.0:${PORT}`);
 });
 
+const matchWatchdog = setInterval(() => runMatchWatchdog(), MATCH_WATCHDOG_INTERVAL_MS);
+matchWatchdog.unref();
+
 function shutdown(signal: string): void {
+  clearInterval(matchWatchdog);
   console.log(`${signal} received. Closing Foster's Floppers server gracefully.`);
   for (const socket of contexts.keys()) {
     try {
@@ -263,6 +274,7 @@ function handleMessage(socket: WebSocket, message: ClientMessage): void {
   if (!message || typeof message.type !== 'string') throw new Error('Invalid message.');
   if (message.type === 'HOST_ROOM') return hostRoom(socket, message.name);
   if (message.type === 'JOIN_ROOM') return joinRoom(socket, message.name, message.code);
+  if (message.type === 'RESUME_SESSION') return resumeSession(socket, message.playerId, message.code);
 
   const context = contexts.get(socket);
   const room = context?.roomCode ? rooms.get(context.roomCode) : undefined;
@@ -360,6 +372,32 @@ function joinRoom(socket: WebSocket, rawName: string, rawCode: string): void {
   broadcast(room);
 }
 
+function resumeSession(socket: WebSocket, rawPlayerId: string, rawCode: string): void {
+  const code = String(rawCode ?? '').replace(/\D/g, '').slice(0, 5);
+  const playerId = String(rawPlayerId ?? '').trim();
+  const room = rooms.get(code);
+  const player = room?.players.find((candidate) => candidate.id === playerId && !candidate.isBot);
+  if (!room || !player) throw new Error('Your previous room session is no longer available. Return to the start screen and join again.');
+
+  // Remove any stale socket for this player before closing it. Otherwise its
+  // close event could mark the freshly resumed player as disconnected again.
+  for (const [existingSocket, context] of contexts.entries()) {
+    if (existingSocket === socket) continue;
+    if (context.roomCode !== code || context.playerId !== playerId) continue;
+    contexts.delete(existingSocket);
+    try {
+      existingSocket.close(1000, 'Session resumed on another connection');
+    } catch {
+      // Ignore sockets that have already gone away.
+    }
+  }
+
+  player.connected = true;
+  contexts.set(socket, { roomCode: code, playerId });
+  send(socket, { type: 'WELCOME', playerId, room: serializeRoom(room) });
+  broadcast(room);
+}
+
 function selectCharacter(room: Room, player: Player, characterId: string): void {
   if (room.status !== 'SETUP') throw new Error('Characters cannot be changed after the bracket is created.');
   if (!CHARACTER_IDS.includes(characterId)) throw new Error('That character is unavailable.');
@@ -407,6 +445,7 @@ function createTournament(room: Room): void {
   room.roundNumber = 1;
   room.status = 'BRACKET';
   room.finalWinnerId = undefined;
+  room.roundAdvanceAt = undefined;
   broadcast(room);
 }
 
@@ -432,13 +471,16 @@ function startRound(room: Room): void {
 
 function scheduleFlopTransition(room: Room, match: Match): void {
   const allAutomated = isAutomated(room, match.playerAId) && isAutomated(room, match.playerBId);
-  schedule(room, match, allAutomated ? AUTOMATED_FLOP_SCENE_MS : HUMAN_FLOP_SCENE_MS, () => advanceToFreeThrow(room, match));
+  const delay = allAutomated ? AUTOMATED_FLOP_SCENE_MS : HUMAN_FLOP_SCENE_MS;
+  match.phaseDeadlineAt = Date.now() + delay;
+  schedule(room, match, delay, () => advanceToFreeThrow(room, match));
 }
 
 function advanceToFreeThrow(room: Room, match: Match): void {
   if (room.status !== 'ACTIVE' || match.phase !== 'FLOP') return;
   if (!match.floppedPlayerIds.includes(match.activeShooterId)) match.floppedPlayerIds.push(match.activeShooterId);
   match.phase = 'FREE_THROW';
+  match.phaseDeadlineAt = undefined;
   match.shotInFlight = false;
   match.distraction = undefined;
   prepareFreeThrowTurn(room, match);
@@ -447,6 +489,7 @@ function advanceToFreeThrow(room: Room, match: Match): void {
 function prepareFreeThrowTurn(room: Room, match: Match): void {
   if (room.status !== 'ACTIVE' || match.phase !== 'FREE_THROW' || match.shotInFlight) return;
 
+  match.phaseDeadlineAt = undefined;
   const now = Date.now();
   const turnId = randomUUID();
   match.turnId = turnId;
@@ -575,6 +618,7 @@ function takeAutomatedShot(room: Room, match: Match): void {
 function resolveShot(room: Room, match: Match, direction: number, power: number): void {
   if (match.phase !== 'FREE_THROW' || match.shotInFlight) return;
   match.shotInFlight = true;
+  match.phaseDeadlineAt = Date.now() + SHOT_FLIGHT_WATCHDOG_GRACE_MS;
   match.autoShotScheduled = false;
   match.turnReadyAt = undefined;
   match.turnStartedAt = undefined;
@@ -617,6 +661,7 @@ function resolveShot(room: Room, match: Match, direction: number, power: number)
 function finishResolvedShot(room: Room, match: Match): void {
   if (room.status !== 'ACTIVE' || match.phase !== 'FREE_THROW' || !match.shotInFlight) return;
   match.shotInFlight = false;
+  match.phaseDeadlineAt = undefined;
   match.distraction = undefined;
   match.distractionUsedByPlayerId = undefined;
 
@@ -702,6 +747,8 @@ function maybeAutomatedDefenderDistracts(room: Room, match: Match, turnId: strin
 
 function completeMatch(room: Room, match: Match, winnerId: string): void {
   match.phase = 'COMPLETE';
+  match.completedAt = Date.now();
+  match.phaseDeadlineAt = undefined;
   match.shotInFlight = false;
   match.autoShotScheduled = false;
   match.turnReadyAt = undefined;
@@ -725,23 +772,32 @@ function completeMatch(room: Room, match: Match, winnerId: string): void {
   const matches = currentMatches(room);
   if (!matches.every((candidate) => candidate.phase === 'COMPLETE')) return;
 
-  schedule(room, match, 2400, () => {
-    if (room.status !== 'ACTIVE') return;
-    if (matches.length === 1) {
-      room.status = 'COMPLETE';
-      room.finalWinnerId = matches[0].winnerId;
-      broadcast(room);
-      return;
-    }
+  room.roundAdvanceAt = Date.now() + 2400;
+  schedule(room, match, 2400, () => advanceCompletedRound(room));
+}
 
-    const winners = matches.map((candidate) => candidate.winnerId).filter((id): id is string => Boolean(id));
-    room.roundNumber += 1;
-    const nextMatches = createMatches(winners, room.roundNumber);
-    room.matches.push(...nextMatches);
-    room.currentRoundMatchIds = nextMatches.map((candidate) => candidate.id);
-    room.status = 'BRACKET';
+function advanceCompletedRound(room: Room): void {
+  if (room.status !== 'ACTIVE') return;
+  const matches = currentMatches(room);
+  if (!matches.length || !matches.every((candidate) => candidate.phase === 'COMPLETE')) return;
+  if ((room.roundAdvanceAt ?? 0) > Date.now()) return;
+
+  room.roundAdvanceAt = undefined;
+  if (matches.length === 1) {
+    room.status = 'COMPLETE';
+    room.finalWinnerId = matches[0].winnerId;
     broadcast(room);
-  });
+    return;
+  }
+
+  const winners = matches.map((candidate) => candidate.winnerId).filter((id): id is string => Boolean(id));
+  if (winners.length !== matches.length) return;
+  room.roundNumber += 1;
+  const nextMatches = createMatches(winners, room.roundNumber);
+  room.matches.push(...nextMatches);
+  room.currentRoundMatchIds = nextMatches.map((candidate) => candidate.id);
+  room.status = 'BRACKET';
+  broadcast(room);
 }
 
 function resetTournament(room: Room, clearCharacters = false): void {
@@ -756,6 +812,7 @@ function resetTournament(room: Room, clearCharacters = false): void {
   room.matches = [];
   room.currentRoundMatchIds = [];
   room.finalWinnerId = undefined;
+  room.roundAdvanceAt = undefined;
   broadcast(room);
 }
 
@@ -928,13 +985,76 @@ function inGreen(match: Match, value: number): boolean {
   return value >= 0.5 - halfWidth && value <= 0.5 + halfWidth;
 }
 
+function runMatchWatchdog(): void {
+  const now = Date.now();
+  for (const room of rooms.values()) {
+    if (room.status !== 'ACTIVE') continue;
+
+    for (const match of currentMatches(room)) {
+      try {
+        if (match.phase === 'FLOP') {
+          if (match.phaseDeadlineAt !== undefined && now >= match.phaseDeadlineAt + FREE_THROW_WATCHDOG_GRACE_MS) {
+            console.warn(`Watchdog advanced overdue flop scene ${room.code}/${match.id}.`);
+            advanceToFreeThrow(room, match);
+          }
+          continue;
+        }
+
+        if (match.phase !== 'FREE_THROW') continue;
+
+        if (match.shotInFlight) {
+          const resolvedAt = match.lastShot?.resolvedAt ?? match.phaseDeadlineAt ?? now;
+          if (now >= resolvedAt + SHOT_FLIGHT_WATCHDOG_GRACE_MS) {
+            console.warn(`Watchdog completed overdue shot animation ${room.code}/${match.id}.`);
+            finishResolvedShot(room, match);
+          }
+          continue;
+        }
+
+        if (match.turnDeadlineAt === undefined || match.turnId === undefined) {
+          console.warn(`Watchdog rebuilt missing free-throw turn ${room.code}/${match.id}.`);
+          prepareFreeThrowTurn(room, match);
+          continue;
+        }
+
+        if (now >= match.turnDeadlineAt + FREE_THROW_WATCHDOG_GRACE_MS) {
+          console.warn(`Watchdog resolved expired shot clock ${room.code}/${match.id}.`);
+          const values = calculateMeterValues(match, match.turnDeadlineAt);
+          resolveShot(room, match, values.direction, values.power);
+        }
+      } catch (error) {
+        console.error(`Match watchdog failed for ${room.code}/${match.id}:`, error);
+      }
+    }
+
+    if (
+      room.roundAdvanceAt !== undefined &&
+      now >= room.roundAdvanceAt + FREE_THROW_WATCHDOG_GRACE_MS &&
+      currentMatches(room).every((match) => match.phase === 'COMPLETE')
+    ) {
+      try {
+        console.warn(`Watchdog advanced completed round in room ${room.code}.`);
+        advanceCompletedRound(room);
+      } catch (error) {
+        console.error(`Round watchdog failed for room ${room.code}:`, error);
+      }
+    }
+  }
+}
+
 function schedule(room: Room, match: Match, delayMs: number, callback: () => void): void {
   const key = timerKey(room, match);
   const set = scheduled.get(key) ?? new Set<NodeJS.Timeout>();
   const timer = setTimeout(() => {
     set.delete(timer);
     if (!set.size) scheduled.delete(key);
-    callback();
+    try {
+      callback();
+    } catch (error) {
+      console.error(`Scheduled match task failed for ${key}:`, error);
+      // The independent watchdog below will repair overdue match state instead
+      // of allowing one failed callback to freeze the entire tournament.
+    }
   }, delayMs);
   set.add(timer);
   scheduled.set(key, set);

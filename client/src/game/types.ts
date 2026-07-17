@@ -82,6 +82,7 @@ export interface RoomState {
 export type ClientMessage =
   | { type: 'HOST_ROOM'; name: string }
   | { type: 'JOIN_ROOM'; name: string; code: string }
+  | { type: 'RESUME_SESSION'; playerId: string; code: string }
   | { type: 'SELECT_CHARACTER'; characterId: string }
   | { type: 'SET_TOURNAMENT_SIZE'; size: number }
   | { type: 'CREATE_TOURNAMENT' }

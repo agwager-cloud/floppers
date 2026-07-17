@@ -114,9 +114,28 @@ export function addSoundToggle(scene: Phaser.Scene): Phaser.GameObjects.Containe
 }
 
 export function showToast(scene: Phaser.Scene, message: string, color = 0xff4d67): void {
-  const box = scene.add.rectangle(640, 650, 760, 52, color, 0.96).setStrokeStyle(2, 0xffffff, 0.8).setDepth(1000);
-  const text = scene.add.text(640, 650, message, { fontFamily: 'Arial Black, Arial', fontSize: '19px', color: '#ffffff' }).setOrigin(0.5).setDepth(1001);
-  scene.tweens.add({ targets: [box, text], alpha: 0, delay: 3000, duration: 500, onComplete: () => { box.destroy(); text.destroy(); } });
+  // Long player names and distraction descriptions can exceed a single line on
+  // iPad. Build the text first, wrap it, then size the frame around the result.
+  const text = scene.add.text(640, 650, message, {
+    fontFamily: 'Arial Black, Arial',
+    fontSize: '16px',
+    color: '#ffffff',
+    align: 'center',
+    wordWrap: { width: 900, useAdvancedWrap: true },
+    lineSpacing: 2,
+  }).setOrigin(0.5).setDepth(1001);
+  const boxWidth = Phaser.Math.Clamp(text.width + 44, 520, 960);
+  const boxHeight = Math.max(52, text.height + 22);
+  const box = scene.add.rectangle(640, 650, boxWidth, boxHeight, color, 0.96)
+    .setStrokeStyle(2, 0xffffff, 0.8)
+    .setDepth(1000);
+  scene.tweens.add({
+    targets: [box, text],
+    alpha: 0,
+    delay: 3200,
+    duration: 500,
+    onComplete: () => { box.destroy(); text.destroy(); },
+  });
 }
 
 export function playWhistle(scene: Phaser.Scene): void {
