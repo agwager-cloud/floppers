@@ -1,5 +1,5 @@
 import Phaser from 'phaser';
-import { network } from '../game/Network';
+import { network, type ConnectionProgress } from '../game/Network';
 import { gameSession } from '../game/GameSession';
 import { routeForRoom } from '../game/SceneRouter';
 import { CanvasTextInput } from '../game/CanvasTextInput';
@@ -9,9 +9,14 @@ export class StartScene extends Phaser.Scene {
   private nameInput?: CanvasTextInput;
   private codeInput?: CanvasTextInput;
   private busy = false;
-  private serverStatusText?: Phaser.GameObjects.Text;
   private hostButton?: Phaser.GameObjects.Container;
   private joinButton?: Phaser.GameObjects.Container;
+  private controlBarObjects: Phaser.GameObjects.Rectangle[] = [];
+  private connectionPanel?: Phaser.GameObjects.Container;
+  private connectionTitle?: Phaser.GameObjects.Text;
+  private connectionDetail?: Phaser.GameObjects.Text;
+  private connectionElapsed?: Phaser.GameObjects.Text;
+  private connectionProgressFill?: Phaser.GameObjects.Graphics;
   private cleanups: Array<() => void> = [];
 
   constructor() {
@@ -24,6 +29,7 @@ export class StartScene extends Phaser.Scene {
     gameSession.viewedMatchId = '';
     this.busy = false;
     this.cleanups = [];
+    this.controlBarObjects = [];
     this.hostButton = undefined;
     this.joinButton = undefined;
 
@@ -31,10 +37,12 @@ export class StartScene extends Phaser.Scene {
     this.add.rectangle(640, 360, 1280, 720, 0x02040e, 0.025);
 
     // Compact single-row control bar positioned in the clear arena-light area
-    // beneath the game title and above every background player.
-    this.add.rectangle(688 + 4, 248 + 4, 480, 42, 0x000000, 0.24);
-    this.add.rectangle(688, 248, 480, 42, 0x10183f, 0.7)
+    // beneath the title. All pieces are retained so the row can be hidden while
+    // the fixed classroom connection panel is displayed.
+    const shadow = this.add.rectangle(692, 252, 480, 42, 0x000000, 0.24);
+    const bar = this.add.rectangle(688, 248, 480, 42, 0x10183f, 0.7)
       .setStrokeStyle(2, 0x6f7eff, 0.9);
+    this.controlBarObjects.push(shadow, bar);
 
     this.nameInput = new CanvasTextInput(this, {
       id: 'playerName',
@@ -70,33 +78,75 @@ export class StartScene extends Phaser.Scene {
     });
 
     addSoundToggle(this);
+    this.createConnectionPanel();
 
-    this.serverStatusText = this.add.text(688, 282, '', {
-      fontFamily: 'Arial Black, Arial',
-      fontSize: '14px',
-      color: '#ffe56f',
-      stroke: '#050718',
-      strokeThickness: 4,
-      align: 'center',
-    }).setOrigin(0.5).setDepth(30);
-
-    this.cleanups.push(network.onConnectionStatus((message) => {
-      this.serverStatusText?.setText(message);
-      this.serverStatusText?.setVisible(Boolean(message));
-    }));
+    this.cleanups.push(network.onConnectionProgress((progress) => this.updateConnectionPanel(progress)));
     this.cleanups.push(network.onWelcome(() => {
-      this.serverStatusText?.setText('').setVisible(false);
+      this.updateConnectionPanel({
+        elapsedSeconds: 0,
+        attempt: 1,
+        progress: 1,
+        message: 'Classroom connected. Loading the player screen…',
+      });
       const room = gameSession.room;
       if (room) routeForRoom(this, room);
       else this.scene.start('CharacterSelectScene');
     }));
     this.cleanups.push(network.onError((message) => {
-      this.setBusy(false);
-      this.serverStatusText?.setText('').setVisible(false);
-      showToast(this, message);
+      if (!this.scene.isActive()) return;
+      this.showConnectionFailure(message);
     }));
 
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.cleanup());
+  }
+
+  private createConnectionPanel(): void {
+    const container = this.add.container(688, 370).setDepth(60).setVisible(false);
+    const background = this.add.graphics();
+    background.fillStyle(0xeaf2ff, 0.98);
+    background.fillRoundedRect(-250, -92, 500, 184, 24);
+    background.lineStyle(4, 0x94b7ff, 1);
+    background.strokeRoundedRect(-250, -92, 500, 184, 24);
+
+    this.connectionTitle = this.add.text(0, -64, 'Connecting to classroom server', {
+      fontFamily: 'Arial Black, Arial',
+      fontSize: '23px',
+      color: '#102346',
+      align: 'center',
+    }).setOrigin(0.5);
+
+    this.connectionDetail = this.add.text(0, -20, 'Preparing the classroom connection…', {
+      fontFamily: 'Arial, sans-serif',
+      fontSize: '17px',
+      fontStyle: 'bold',
+      color: '#18345f',
+      align: 'center',
+      wordWrap: { width: 440 },
+    }).setOrigin(0.5);
+
+    const progressBack = this.add.graphics();
+    progressBack.fillStyle(0xc6d0e0, 1);
+    progressBack.fillRoundedRect(-205, 32, 410, 14, 7);
+
+    this.connectionProgressFill = this.add.graphics();
+
+    this.connectionElapsed = this.add.text(0, 67, 'Waiting 0 seconds · free servers can take 60–100 seconds', {
+      fontFamily: 'Arial Black, Arial',
+      fontSize: '14px',
+      color: '#506078',
+      align: 'center',
+      wordWrap: { width: 440 },
+    }).setOrigin(0.5);
+
+    container.add([
+      background,
+      this.connectionTitle,
+      this.connectionDetail,
+      progressBack,
+      this.connectionProgressFill,
+      this.connectionElapsed,
+    ]);
+    this.connectionPanel = container;
   }
 
   private async hostGame(): Promise<void> {
@@ -107,13 +157,12 @@ export class StartScene extends Phaser.Scene {
       this.nameInput?.focus();
       return;
     }
-    this.setBusy(true);
+
+    this.beginConnection('Creating your classroom…');
     try {
-      await network.connect();
-      network.send({ type: 'HOST_ROOM', name });
+      await network.hostRoom(name);
     } catch (error) {
-      this.setBusy(false);
-      showToast(this, error instanceof Error ? error.message : 'Could not connect to the server.');
+      if (this.scene.isActive()) this.showConnectionFailure(error);
     }
   }
 
@@ -127,27 +176,87 @@ export class StartScene extends Phaser.Scene {
       else this.codeInput?.focus();
       return;
     }
-    this.setBusy(true);
+
+    this.beginConnection('Joining the classroom…');
     try {
-      await network.connect();
-      network.send({ type: 'JOIN_ROOM', name, code });
+      await network.joinRoom(name, code);
     } catch (error) {
-      this.setBusy(false);
-      showToast(this, error instanceof Error ? error.message : 'Could not connect to the server.');
+      if (this.scene.isActive()) this.showConnectionFailure(error);
     }
   }
 
+  private beginConnection(message: string): void {
+    this.setBusy(true);
+    this.connectionPanel?.setVisible(true);
+    this.connectionTitle?.setText('Connecting to classroom server').setColor('#102346');
+    this.connectionDetail?.setText(message).setColor('#18345f');
+    this.connectionElapsed?.setText('Waiting 0 seconds · free servers can take 60–100 seconds').setColor('#506078');
+    this.drawProgress(0, false);
+  }
+
+  private updateConnectionPanel(progress: ConnectionProgress): void {
+    if (!this.busy || !this.scene.isActive()) return;
+    this.connectionPanel?.setVisible(true);
+    this.connectionTitle?.setText('Connecting to classroom server').setColor('#102346');
+    this.connectionDetail?.setText(progress.message).setColor('#18345f');
+    this.connectionElapsed?.setText(
+      progress.progress >= 1
+        ? 'Connected · loading classroom'
+        : `Waiting ${progress.elapsedSeconds} seconds · free servers can take 60–100 seconds`,
+    ).setColor('#506078');
+    this.drawProgress(progress.progress, false);
+  }
+
+  private showConnectionFailure(error: unknown): void {
+    const raw = error instanceof Error ? error.message : String(error ?? 'Connection failed.');
+    this.setBusy(false);
+    this.connectionPanel?.setVisible(true);
+    this.connectionTitle?.setText('Could not connect to the classroom server').setColor('#8f2020');
+    this.connectionDetail?.setText(this.connectionFailureMessage(raw)).setColor('#7f2020');
+    this.connectionElapsed?.setText('The Host and Join buttons are ready to try again.').setColor('#506078');
+    this.drawProgress(1, true);
+  }
+
+  private connectionFailureMessage(raw: string): string {
+    if (/room code does not exist|already being used|already has|enter a player name/i.test(raw)) return raw;
+    return `The classroom did not connect after waiting up to 100 seconds. If it works in InPrivate/Incognito but not in a normal window, a browser extension or school filter is blocking this game. Ask IT to allow ${network.publishedServerHost()} and secure WebSocket connections.`;
+  }
+
+  private drawProgress(progress: number, failed: boolean): void {
+    const safe = Math.max(0, Math.min(1, progress));
+    this.connectionProgressFill?.clear();
+    this.connectionProgressFill?.fillStyle(failed ? 0xe52c2c : safe >= 1 ? 0x27a85b : 0x2d66e8, 1);
+    this.connectionProgressFill?.fillRoundedRect(-205, 32, Math.max(6, 410 * safe), 14, 7);
+  }
 
   private setBusy(busy: boolean): void {
     this.busy = busy;
+
+    // Close the mobile keyboard before the status card appears. The controls
+    // are then hidden rather than enlarged, so nothing can drop below the
+    // viewport on a phone, iPad or laptop.
+    this.nameInput?.element.blur();
+    this.codeInput?.element.blur();
+    if (busy) window.setTimeout(() => window.scrollTo(0, 0), 0);
+
+    for (const object of this.controlBarObjects) object.setVisible(!busy);
+    this.setInputVisible(this.nameInput, !busy);
+    this.setInputVisible(this.codeInput, !busy);
+
     for (const button of [this.hostButton, this.joinButton]) {
       if (!button) continue;
-      button.setAlpha(busy ? 0.42 : 1);
+      button.setVisible(!busy);
       const background = button.list[0] as Phaser.GameObjects.Rectangle | undefined;
       if (!background) continue;
       if (busy) background.disableInteractive();
       else background.setInteractive({ useHandCursor: true });
     }
+  }
+
+  private setInputVisible(input: CanvasTextInput | undefined, visible: boolean): void {
+    if (!input) return;
+    input.element.style.visibility = visible ? 'visible' : 'hidden';
+    input.element.disabled = !visible;
   }
 
   private cleanup(): void {
@@ -157,9 +266,14 @@ export class StartScene extends Phaser.Scene {
     this.codeInput?.destroy();
     this.nameInput = undefined;
     this.codeInput = undefined;
-    this.serverStatusText?.destroy();
-    this.serverStatusText = undefined;
+    this.connectionPanel?.destroy(true);
+    this.connectionPanel = undefined;
+    this.connectionTitle = undefined;
+    this.connectionDetail = undefined;
+    this.connectionElapsed = undefined;
+    this.connectionProgressFill = undefined;
     this.hostButton = undefined;
     this.joinButton = undefined;
+    this.controlBarObjects = [];
   }
 }

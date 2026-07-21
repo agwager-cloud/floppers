@@ -191,8 +191,8 @@ interface Room {
 }
 
 type ClientMessage =
-  | { type: 'HOST_ROOM'; name: string }
-  | { type: 'JOIN_ROOM'; name: string; code: string }
+  | { type: 'HOST_ROOM'; name: string; requestId?: string }
+  | { type: 'JOIN_ROOM'; name: string; code: string; requestId?: string }
   | { type: 'RESUME_SESSION'; playerId: string; code: string }
   | { type: 'SELECT_CHARACTER'; characterId: string }
   | { type: 'SET_TOURNAMENT_SIZE'; size: number }
@@ -213,11 +213,15 @@ interface ConnectionContext {
 const rooms = new Map<string, Room>();
 const contexts = new Map<WebSocket, ConnectionContext>();
 const scheduled = new Map<string, Set<NodeJS.Timeout>>();
+const requestBindings = new Map<string, { roomCode: string; playerId: string; createdAt: number }>();
+const emptyRoomCleanupTimers = new Map<string, NodeJS.Timeout>();
+const REQUEST_BINDING_TTL_MS = 3 * 60_000;
+const EMPTY_ROOM_GRACE_MS = 2 * 60_000;
 
 const server = createServer((request, response) => {
   response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Content-Type', 'application/json');
-  if (request.url === '/health' || request.url === '/') {
+  if (request.url === '/health' || request.url === '/api/status' || request.url === '/') {
     response.writeHead(200);
     response.end(JSON.stringify({ ok: true, game: "Foster's Floppers", rooms: rooms.size }));
     return;
@@ -253,6 +257,8 @@ matchWatchdog.unref();
 
 function shutdown(signal: string): void {
   clearInterval(matchWatchdog);
+  for (const timer of emptyRoomCleanupTimers.values()) clearTimeout(timer);
+  emptyRoomCleanupTimers.clear();
   console.log(`${signal} received. Closing Foster's Floppers server gracefully.`);
   for (const socket of contexts.keys()) {
     try {
@@ -272,8 +278,8 @@ process.once('SIGINT', () => shutdown('SIGINT'));
 
 function handleMessage(socket: WebSocket, message: ClientMessage): void {
   if (!message || typeof message.type !== 'string') throw new Error('Invalid message.');
-  if (message.type === 'HOST_ROOM') return hostRoom(socket, message.name);
-  if (message.type === 'JOIN_ROOM') return joinRoom(socket, message.name, message.code);
+  if (message.type === 'HOST_ROOM') return hostRoom(socket, message.name, message.requestId);
+  if (message.type === 'JOIN_ROOM') return joinRoom(socket, message.name, message.code, message.requestId);
   if (message.type === 'RESUME_SESSION') return resumeSession(socket, message.playerId, message.code);
 
   const context = contexts.get(socket);
@@ -321,8 +327,10 @@ function handleMessage(socket: WebSocket, message: ClientMessage): void {
   }
 }
 
-function hostRoom(socket: WebSocket, rawName: string): void {
+function hostRoom(socket: WebSocket, rawName: string, rawRequestId?: string): void {
   const name = sanitizeName(rawName);
+  const requestId = sanitizeRequestId(rawRequestId);
+  if (requestId && resumeBoundRequest(socket, requestId, name)) return;
   const code = createRoomCode();
   const player: Player = { id: randomUUID(), name, isHost: true, isBot: false, connected: true };
   const room: Room = {
@@ -336,12 +344,16 @@ function hostRoom(socket: WebSocket, rawName: string): void {
   };
   rooms.set(code, room);
   contexts.set(socket, { roomCode: code, playerId: player.id });
+  if (requestId) requestBindings.set(requestId, { roomCode: code, playerId: player.id, createdAt: Date.now() });
+  cancelEmptyRoomCleanup(code);
   send(socket, { type: 'WELCOME', playerId: player.id, room: serializeRoom(room) });
   broadcast(room);
 }
 
-function joinRoom(socket: WebSocket, rawName: string, rawCode: string): void {
+function joinRoom(socket: WebSocket, rawName: string, rawCode: string, rawRequestId?: string): void {
   const name = sanitizeName(rawName);
+  const requestId = sanitizeRequestId(rawRequestId);
+  if (requestId && resumeBoundRequest(socket, requestId, name)) return;
   const code = String(rawCode ?? '').replace(/\D/g, '').slice(0, 5);
   const room = rooms.get(code);
   if (!room) throw new Error('That room code does not exist.');
@@ -368,6 +380,8 @@ function joinRoom(socket: WebSocket, rawName: string, rawCode: string): void {
   };
   room.players.push(player);
   contexts.set(socket, { roomCode: code, playerId: player.id });
+  if (requestId) requestBindings.set(requestId, { roomCode: code, playerId: player.id, createdAt: Date.now() });
+  cancelEmptyRoomCleanup(code);
   send(socket, { type: 'WELCOME', playerId: player.id, room: serializeRoom(room) });
   broadcast(room);
 }
@@ -394,6 +408,7 @@ function resumeSession(socket: WebSocket, rawPlayerId: string, rawCode: string):
 
   player.connected = true;
   contexts.set(socket, { roomCode: code, playerId });
+  cancelEmptyRoomCleanup(code);
   send(socket, { type: 'WELCOME', playerId, room: serializeRoom(room) });
   broadcast(room);
 }
@@ -859,9 +874,75 @@ function handleDisconnect(socket: WebSocket): void {
   }
   broadcast(room);
   if (player.isHost && room.status === 'SETUP' && room.players.filter((candidate) => !candidate.isBot && candidate.connected).length === 0) {
-    clearRoomTimers(room);
-    rooms.delete(room.code);
+    scheduleEmptyRoomCleanup(room);
   }
+}
+
+
+function sanitizeRequestId(rawRequestId?: string): string {
+  return String(rawRequestId ?? '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 96);
+}
+
+function resumeBoundRequest(socket: WebSocket, requestId: string, expectedName: string): boolean {
+  pruneRequestBindings();
+  const binding = requestBindings.get(requestId);
+  if (!binding) return false;
+
+  const room = rooms.get(binding.roomCode);
+  const player = room?.players.find((candidate) => candidate.id === binding.playerId && !candidate.isBot);
+  if (!room || !player || player.name.toLowerCase() !== expectedName.toLowerCase()) {
+    requestBindings.delete(requestId);
+    return false;
+  }
+
+  // Remove the old context before closing its socket so its delayed close event
+  // cannot mark the freshly rebound player as disconnected again.
+  for (const [existingSocket, context] of contexts.entries()) {
+    if (existingSocket === socket) continue;
+    if (context.roomCode === room.code && context.playerId === player.id) {
+      contexts.delete(existingSocket);
+      try { existingSocket.close(1000, 'Classroom request resumed on another connection'); } catch { /* ignored */ }
+    }
+  }
+
+  player.connected = true;
+  contexts.set(socket, { roomCode: room.code, playerId: player.id });
+  cancelEmptyRoomCleanup(room.code);
+  send(socket, { type: 'WELCOME', playerId: player.id, room: serializeRoom(room) });
+  broadcast(room);
+  return true;
+}
+
+function pruneRequestBindings(): void {
+  const cutoff = Date.now() - REQUEST_BINDING_TTL_MS;
+  for (const [requestId, binding] of requestBindings.entries()) {
+    if (binding.createdAt < cutoff || !rooms.has(binding.roomCode)) requestBindings.delete(requestId);
+  }
+}
+
+function scheduleEmptyRoomCleanup(room: Room): void {
+  cancelEmptyRoomCleanup(room.code);
+  const timer = setTimeout(() => {
+    emptyRoomCleanupTimers.delete(room.code);
+    const current = rooms.get(room.code);
+    if (!current || current.status !== 'SETUP') return;
+    const connectedHumans = current.players.filter((candidate) => !candidate.isBot && candidate.connected);
+    if (connectedHumans.length > 0) return;
+    clearRoomTimers(current);
+    rooms.delete(current.code);
+    for (const [requestId, binding] of requestBindings.entries()) {
+      if (binding.roomCode === current.code) requestBindings.delete(requestId);
+    }
+  }, EMPTY_ROOM_GRACE_MS);
+  timer.unref();
+  emptyRoomCleanupTimers.set(room.code, timer);
+}
+
+function cancelEmptyRoomCleanup(roomCode: string): void {
+  const timer = emptyRoomCleanupTimers.get(roomCode);
+  if (!timer) return;
+  clearTimeout(timer);
+  emptyRoomCleanupTimers.delete(roomCode);
 }
 
 function createMatches(playerIds: string[], round: number): Match[] {

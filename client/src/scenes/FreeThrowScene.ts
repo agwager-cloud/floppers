@@ -12,6 +12,7 @@ const CROSS_Y = 530;
 const HORIZONTAL_RANGE = 286;
 const VERTICAL_RANGE = 220;
 const animatedShotIds = new Set<string>();
+const revealedScoreShotIds = new Set<string>();
 
 // These are the visible zone sizes. At 11-11+ the server uses an even smaller
 // scoring tolerance inside this basketball-sized target, requiring a virtually
@@ -350,8 +351,32 @@ export class FreeThrowScene extends Phaser.Scene {
   private attemptShot(): void {
     const match = gameSession.room?.matches.find((candidate) => candidate.id === this.matchId);
     if (!match || match.phase !== 'FREE_THROW' || match.activeShooterId !== gameSession.playerId || match.shotInFlight || this.shotLocked) return;
+
+    // Freeze the meter at the exact positions the player can currently see.
+    // The server receives this same snapshot, so the markers never jump to a
+    // different release point when the network confirmation arrives.
+    const releaseDirection = this.directionValue;
+    const releasePower = this.powerValue;
     this.shotLocked = true;
-    network.send({ type: 'SHOT', matchId: match.id, direction: this.directionValue, power: this.powerValue });
+    this.directionValue = releaseDirection;
+    this.powerValue = releasePower;
+    this.positionMeterBalls();
+    this.countdownText?.setText('SHOT AWAY').setColor('#ffffff').setScale(1);
+    this.fairnessText?.setText('RELEASE LOCKED').setColor('#67f2a8');
+
+    // Give immediate tactile-looking feedback without moving the markers away
+    // from the chosen release point.
+    const releaseMarkers = [this.directionBall, this.powerBall].filter(Boolean) as Phaser.GameObjects.Container[];
+    this.tweens.killTweensOf(releaseMarkers);
+    this.tweens.add({
+      targets: releaseMarkers,
+      scale: 1.12,
+      duration: 70,
+      yoyo: true,
+      ease: 'Sine.Out',
+    });
+
+    network.send({ type: 'SHOT', matchId: match.id, direction: releaseDirection, power: releasePower });
   }
 
   private distract(distractionType: string): void {
@@ -443,8 +468,10 @@ export class FreeThrowScene extends Phaser.Scene {
             : 'basketballs hidden for 3 seconds';
         showToast(this, `${defender?.name ?? 'The defender'} used ${match.distraction.type} — ${effect}!`, COLORS.orange);
 
-        const localPlayerIsInMatch = match.playerAId === gameSession.playerId || match.playerBId === gameSession.playerId;
-        if (match.distraction.type === 'BAD DANCE' && localPlayerIsInMatch) {
+        // Everyone currently watching this live matchup should see Bad Dance,
+        // including the shooter, defender and spectators. That makes the effect
+        // obvious and keeps all viewers visually in sync.
+        if (match.distraction.type === 'BAD DANCE') {
           const startDelay = Math.max(0, (match.distraction.startedAt ?? Date.now()) - Date.now());
           const duration = Math.max(500, (match.distraction.expiresAt ?? Date.now() + 500) - Math.max(Date.now(), match.distraction.startedAt ?? Date.now()));
           this.time.delayedCall(startDelay, () => {
@@ -456,7 +483,9 @@ export class FreeThrowScene extends Phaser.Scene {
 
     if (match.lastShot && match.shotInFlight && match.lastShot.id !== this.lastAnimatedShotId) {
       this.shotLocked = true;
-      this.settleMeterAtShot(match.lastShot.direction, match.lastShot.power);
+      // Keep the meter exactly where it was visually released. Moving the
+      // markers to the server result here caused the noticeable last-moment
+      // jump reported by human shooters.
       this.animateShot(match.lastShot);
       return;
     }
@@ -469,32 +498,6 @@ export class FreeThrowScene extends Phaser.Scene {
     if (match.activeShooterId !== this.shooterId || (!match.shotInFlight && this.shotLocked)) {
       this.queueRestart();
     }
-  }
-
-  private settleMeterAtShot(direction: number, power: number): void {
-    const fromDirection = this.directionValue;
-    const fromPower = this.powerValue;
-    const progress = { value: 0 };
-
-    // Network delivery can arrive a few frames after the server resolves a bot
-    // shot. Ease those final few pixels into place instead of visibly snapping
-    // the markers to the recorded result.
-    this.tweens.add({
-      targets: progress,
-      value: 1,
-      duration: 90,
-      ease: 'Sine.Out',
-      onUpdate: () => {
-        this.directionValue = Phaser.Math.Linear(fromDirection, direction, progress.value);
-        this.powerValue = Phaser.Math.Linear(fromPower, power, progress.value);
-        this.positionMeterBalls();
-      },
-      onComplete: () => {
-        this.directionValue = direction;
-        this.powerValue = power;
-        this.positionMeterBalls();
-      },
-    });
   }
 
   private calculateMeterValues(match: MatchState, at: number): { direction: number; power: number } {
@@ -563,8 +566,8 @@ export class FreeThrowScene extends Phaser.Scene {
   }
 
   private updateDistractionWindow(match: MatchState): void {
-    if (match.shotInFlight) {
-      this.fairnessText?.setText('SHOT IN FLIGHT').setColor('#ffffff');
+    if (match.shotInFlight || this.shotLocked) {
+      this.fairnessText?.setText(match.shotInFlight ? 'SHOT IN FLIGHT' : 'RELEASE LOCKED').setColor('#ffffff');
       return;
     }
     const remainingMs = Math.max(0, (match.distractionWindowClosesAt ?? 0) - Date.now());
@@ -586,7 +589,7 @@ export class FreeThrowScene extends Phaser.Scene {
 
   private updateShotClock(match: MatchState): void {
     if (!this.countdownText?.active) return;
-    if (match.shotInFlight) {
+    if (match.shotInFlight || this.shotLocked) {
       this.countdownText.setText('SHOT AWAY').setColor('#ffffff').setScale(1);
       this.lastCountdownSecond = -1;
       return;
@@ -674,6 +677,20 @@ export class FreeThrowScene extends Phaser.Scene {
       onComplete: () => {
         ball.destroy();
         this.animationPlaying = false;
+
+        // The server already knows whether the shot scored, but the visible
+        // scorecards stay on the pre-shot total until the ball animation has
+        // fully finished. Reveal the point now for shooters, defenders and
+        // spectators at exactly the same visual moment.
+        revealedScoreShotIds.add(shot.id);
+        if (revealedScoreShotIds.size > 100) {
+          const oldest = revealedScoreShotIds.values().next().value as string | undefined;
+          if (oldest) revealedScoreShotIds.delete(oldest);
+        }
+        const scoreRoom = gameSession.room;
+        const scoreMatch = scoreRoom?.matches.find((candidate) => candidate.id === this.matchId);
+        if (scoreRoom && scoreMatch) this.refreshScoreCards(scoreMatch, scoreRoom);
+
         this.time.delayedCall(180, () => {
           const latestRoom = gameSession.room;
           const latestMatch = latestRoom?.matches.find((candidate) => candidate.id === this.matchId);
@@ -712,9 +729,25 @@ export class FreeThrowScene extends Phaser.Scene {
   private refreshScoreCards(match: MatchState, room: RoomState): void {
     this.scoreCards.forEach((card) => card.destroy());
     const { a, b } = getMatchPlayers(match, room.players);
+    let displayScoreA = match.scoreA;
+    let displayScoreB = match.scoreB;
+
+    // A made shot is applied by the authoritative server when it is released so
+    // match logic remains safe. Visually hide that pending point while the ball
+    // is still travelling, then reveal it in animateShot.onComplete().
+    const pendingShot = match.lastShot;
+    if (
+      match.shotInFlight
+      && pendingShot?.made
+      && !revealedScoreShotIds.has(pendingShot.id)
+    ) {
+      if (pendingShot.shooterId === match.playerAId) displayScoreA = Math.max(0, displayScoreA - 1);
+      if (pendingShot.shooterId === match.playerBId) displayScoreB = Math.max(0, displayScoreB - 1);
+    }
+
     this.scoreCards = [
-      addScoreCard(this, 175, 145, a, match.scoreA, match.activeShooterId === a.id),
-      addScoreCard(this, 1105, 145, b, match.scoreB, match.activeShooterId === b.id),
+      addScoreCard(this, 175, 145, a, displayScoreA, match.activeShooterId === a.id),
+      addScoreCard(this, 1105, 145, b, displayScoreB, match.activeShooterId === b.id),
     ];
     this.scoreCards.forEach((card) => card.setDepth(25));
   }
