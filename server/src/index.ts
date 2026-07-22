@@ -235,9 +235,9 @@ const wss = new WebSocketServer({ server });
 wss.on('connection', (socket) => {
   contexts.set(socket, {});
 
-  socket.on('message', (data) => {
+  socket.on('message', (data: unknown) => {
     try {
-      const message = JSON.parse(data.toString()) as ClientMessage;
+      const message = JSON.parse(String(data)) as ClientMessage;
       handleMessage(socket, message);
     } catch (error) {
       sendError(socket, error instanceof Error ? error.message : 'Invalid request.');
@@ -796,34 +796,134 @@ function completeMatch(room: Room, match: Match, winnerId: string): void {
   clearMatchTimers(room, match);
   broadcast(room);
 
-  const matches = currentMatches(room);
-  if (!matches.every((candidate) => candidate.phase === 'COMPLETE')) return;
+  const matches = orderedCurrentRoundMatches(room, true);
+  if (!matches.length || !matches.every((candidate) => candidate.phase === 'COMPLETE')) return;
 
-  room.roundAdvanceAt = Date.now() + 2400;
-  schedule(room, match, 2400, () => advanceCompletedRound(room));
+  // Store a room-level deadline as well as scheduling the normal callback. If a
+  // timer is cancelled, delayed or throws, the independent watchdog can still
+  // finish the round and build the next bracket.
+  const advanceAt = Date.now() + 2400;
+  room.roundAdvanceAt = room.roundAdvanceAt === undefined
+    ? advanceAt
+    : Math.min(room.roundAdvanceAt, advanceAt);
+  schedule(room, match, Math.max(0, room.roundAdvanceAt - Date.now()), () => advanceCompletedRound(room));
+}
+
+function orderedCurrentRoundMatches(room: Room, repairIds = false): Match[] {
+  const byRound = room.matches
+    .filter((candidate) => candidate.round === room.roundNumber)
+    .sort((a, b) => a.slot - b.slot);
+  const byIds = currentMatches(room).sort((a, b) => a.slot - b.slot);
+  const selected = byRound.length ? byRound : byIds;
+
+  if (repairIds && selected.length) {
+    const expectedIds = selected.map((candidate) => candidate.id);
+    const idsMatch = expectedIds.length === room.currentRoundMatchIds.length
+      && expectedIds.every((id, index) => room.currentRoundMatchIds[index] === id);
+    if (!idsMatch) {
+      console.warn(`Repaired current-round match IDs in room ${room.code} for round ${room.roundNumber}.`);
+      room.currentRoundMatchIds = expectedIds;
+    }
+  }
+  return selected;
+}
+
+function repairCompletedWinner(room: Room, match: Match): boolean {
+  if (match.winnerId === match.playerAId || match.winnerId === match.playerBId) return true;
+
+  // A COMPLETE match should always have a winner. Recover the winner from the
+  // authoritative score when possible. If the score is tied, safely reopen the
+  // matchup in sudden-death mode instead of freezing the tournament forever.
+  const inferred = determineWinner(match)
+    ?? (match.scoreA !== match.scoreB ? (match.scoreA > match.scoreB ? match.playerAId : match.playerBId) : undefined);
+  if (inferred) {
+    console.warn(`Recovered missing winner for ${room.code}/${match.id}.`);
+    match.winnerId = inferred;
+    return true;
+  }
+
+  console.warn(`Reopened tied COMPLETE matchup ${room.code}/${match.id} so the tournament can continue.`);
+  match.phase = 'FREE_THROW';
+  match.completedAt = undefined;
+  match.winnerId = undefined;
+  match.shotInFlight = false;
+  match.lastShot = undefined;
+  match.attemptsRemaining = 1;
+  match.activeShooterId = match.activeShooterId === match.playerAId || match.activeShooterId === match.playerBId
+    ? match.activeShooterId
+    : match.playerAId;
+  room.roundAdvanceAt = undefined;
+  prepareFreeThrowTurn(room, match);
+  return false;
+}
+
+function nextRoundMatchesAreValid(existing: Match[], winners: string[]): boolean {
+  if (existing.length !== winners.length / 2) return false;
+  return existing.every((match, index) => {
+    const playerAId = winners[index * 2];
+    const playerBId = winners[index * 2 + 1];
+    return match.slot === index
+      && match.playerAId === playerAId
+      && match.playerBId === playerBId
+      && match.phase === 'WAITING';
+  });
 }
 
 function advanceCompletedRound(room: Room): void {
+  if (room.status === 'COMPLETE') return;
   if (room.status !== 'ACTIVE') return;
-  const matches = currentMatches(room);
-  if (!matches.length || !matches.every((candidate) => candidate.phase === 'COMPLETE')) return;
-  if ((room.roundAdvanceAt ?? 0) > Date.now()) return;
 
-  room.roundAdvanceAt = undefined;
+  const matches = orderedCurrentRoundMatches(room, true);
+  if (!matches.length || !matches.every((candidate) => candidate.phase === 'COMPLETE')) return;
+  if (room.roundAdvanceAt !== undefined && room.roundAdvanceAt > Date.now()) return;
+
+  for (const match of matches) {
+    if (!repairCompletedWinner(room, match)) {
+      broadcast(room);
+      return;
+    }
+  }
+
+  const winners = matches.map((candidate) => candidate.winnerId as string);
   if (matches.length === 1) {
     room.status = 'COMPLETE';
-    room.finalWinnerId = matches[0].winnerId;
+    room.finalWinnerId = winners[0];
+    room.roundAdvanceAt = undefined;
     broadcast(room);
     return;
   }
 
-  const winners = matches.map((candidate) => candidate.winnerId).filter((id): id is string => Boolean(id));
-  if (winners.length !== matches.length) return;
-  room.roundNumber += 1;
-  const nextMatches = createMatches(winners, room.roundNumber);
-  room.matches.push(...nextMatches);
+  if (winners.length % 2 !== 0) {
+    console.error(`Round ${room.roundNumber} in room ${room.code} has an odd number of winners.`);
+    room.roundAdvanceAt = Date.now() + 1000;
+    return;
+  }
+
+  const nextRound = room.roundNumber + 1;
+  let nextMatches = room.matches
+    .filter((candidate) => candidate.round === nextRound)
+    .sort((a, b) => a.slot - b.slot);
+
+  if (nextMatches.length && !nextRoundMatchesAreValid(nextMatches, winners)) {
+    console.warn(`Removed a partial or inconsistent round ${nextRound} transition in room ${room.code}.`);
+    for (const match of nextMatches) clearMatchTimers(room, match);
+    room.matches = room.matches.filter((candidate) => candidate.round !== nextRound);
+    nextMatches = [];
+  }
+
+  // If a previous callback created the next matches but failed before updating
+  // room.status/currentRoundMatchIds, reuse those matches instead of duplicating
+  // the final or the next round.
+  if (!nextMatches.length) {
+    nextMatches = createMatches(winners, nextRound);
+    room.matches.push(...nextMatches);
+  }
+
+  room.roundNumber = nextRound;
   room.currentRoundMatchIds = nextMatches.map((candidate) => candidate.id);
   room.status = 'BRACKET';
+  room.finalWinnerId = undefined;
+  room.roundAdvanceAt = undefined;
   broadcast(room);
 }
 
@@ -1085,9 +1185,25 @@ function inGreen(match: Match, value: number): boolean {
 function runMatchWatchdog(): void {
   const now = Date.now();
   for (const room of rooms.values()) {
+    if (room.status === 'BRACKET') {
+      orderedCurrentRoundMatches(room, true);
+      continue;
+    }
     if (room.status !== 'ACTIVE') continue;
 
-    for (const match of currentMatches(room)) {
+    const matches = orderedCurrentRoundMatches(room, true);
+
+    // Repair a transition that created the next round and updated roundNumber,
+    // but was interrupted before changing ACTIVE to BRACKET.
+    if (matches.length && matches.every((match) => match.phase === 'WAITING')) {
+      console.warn(`Watchdog repaired an interrupted bracket transition in room ${room.code}.`);
+      room.status = 'BRACKET';
+      room.roundAdvanceAt = undefined;
+      broadcast(room);
+      continue;
+    }
+
+    for (const match of matches) {
       try {
         if (match.phase === 'FLOP') {
           if (match.phaseDeadlineAt !== undefined && now >= match.phaseDeadlineAt + FREE_THROW_WATCHDOG_GRACE_MS) {
@@ -1124,16 +1240,25 @@ function runMatchWatchdog(): void {
       }
     }
 
-    if (
-      room.roundAdvanceAt !== undefined &&
-      now >= room.roundAdvanceAt + FREE_THROW_WATCHDOG_GRACE_MS &&
-      currentMatches(room).every((match) => match.phase === 'COMPLETE')
-    ) {
-      try {
-        console.warn(`Watchdog advanced completed round in room ${room.code}.`);
-        advanceCompletedRound(room);
-      } catch (error) {
-        console.error(`Round watchdog failed for room ${room.code}:`, error);
+    const completedMatches = orderedCurrentRoundMatches(room, true);
+    if (completedMatches.length && completedMatches.every((match) => match.phase === 'COMPLETE')) {
+      // Older state could lose the scheduled callback or its room-level deadline.
+      // Recreate the deadline from completion timestamps and keep trying until the
+      // bracket or final state is successfully committed.
+      if (room.roundAdvanceAt === undefined) {
+        const latestCompletedAt = Math.max(...completedMatches.map((match) => match.completedAt ?? now));
+        room.roundAdvanceAt = Math.max(now, latestCompletedAt + 2400);
+        console.warn(`Watchdog restored a missing round transition deadline in room ${room.code}.`);
+      }
+
+      if (now >= room.roundAdvanceAt + FREE_THROW_WATCHDOG_GRACE_MS) {
+        try {
+          console.warn(`Watchdog advanced completed round in room ${room.code}.`);
+          advanceCompletedRound(room);
+        } catch (error) {
+          console.error(`Round watchdog failed for room ${room.code}:`, error);
+          room.roundAdvanceAt = Date.now() + 1000;
+        }
       }
     }
   }
