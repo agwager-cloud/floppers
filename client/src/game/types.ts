@@ -45,6 +45,8 @@ export interface MatchState {
     resultAudioKey?: string;
   };
   turnReadyAt?: number;
+  awaitingShooterReady?: boolean;
+  turnReadyFallbackAt?: number;
   turnStartedAt?: number;
   turnDeadlineAt?: number;
   distractionWindowClosesAt?: number;
@@ -70,6 +72,7 @@ export interface MatchState {
 }
 
 export interface RoomState {
+  serverNow?: number;
   code: string;
   status: RoomStatus;
   players: PlayerState[];
@@ -88,8 +91,9 @@ export type ClientMessage =
   | { type: 'SET_TOURNAMENT_SIZE'; size: number }
   | { type: 'CREATE_TOURNAMENT' }
   | { type: 'START_ROUND' }
-  | { type: 'SHOT'; matchId: string; direction: number; power: number }
-  | { type: 'DISTRACT'; matchId: string; distractionType: string }
+  | { type: 'FREE_THROW_READY'; matchId: string; turnId: string }
+  | { type: 'SHOT'; matchId: string; turnId?: string; direction: number; power: number; releasedAt?: number }
+  | { type: 'DISTRACT'; matchId: string; turnId?: string; distractionType: string }
   | { type: 'RESET_TOURNAMENT' }
   | { type: 'CHANGE_PLAYERS' }
   | { type: 'RETURN_TO_LOBBY' }

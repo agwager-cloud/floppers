@@ -12,8 +12,9 @@ const BASE_GREEN_HALF_WIDTH = 0.14;
 const GREEN_SUCCESS_HALF_WIDTHS = [BASE_GREEN_HALF_WIDTH, 0.115, 0.095, 0.078, 0.065, 0.012] as const;
 const SHOT_CLOCK_MS = 10_000;
 const DISTRACTION_WINDOW_MS = 6_000;
-const DISTRACTION_DELAY_MS = 250;
+const DISTRACTION_DELAY_MS = 500;
 const DISTRACTION_EFFECT_MS = 3_000;
+const HUMAN_TURN_READY_FALLBACK_MS = 3_500;
 const MATCH_WATCHDOG_INTERVAL_MS = 500;
 const FREE_THROW_WATCHDOG_GRACE_MS = 1_200;
 const SHOT_FLIGHT_WATCHDOG_GRACE_MS = 3_200;
@@ -162,6 +163,8 @@ interface Match {
   shotInFlight: boolean;
   lastShot?: { id: string; shooterId: string; made: boolean; direction: number; power: number; resolvedAt: number; resultAudioKey: string };
   turnReadyAt?: number;
+  awaitingShooterReady?: boolean;
+  turnReadyFallbackAt?: number;
   turnStartedAt?: number;
   turnDeadlineAt?: number;
   distractionWindowClosesAt?: number;
@@ -198,8 +201,9 @@ type ClientMessage =
   | { type: 'SET_TOURNAMENT_SIZE'; size: number }
   | { type: 'CREATE_TOURNAMENT' }
   | { type: 'START_ROUND' }
-  | { type: 'SHOT'; matchId: string; direction: number; power: number }
-  | { type: 'DISTRACT'; matchId: string; distractionType: string }
+  | { type: 'FREE_THROW_READY'; matchId: string; turnId: string }
+  | { type: 'SHOT'; matchId: string; turnId?: string; direction: number; power: number; releasedAt?: number }
+  | { type: 'DISTRACT'; matchId: string; turnId?: string; distractionType: string }
   | { type: 'RESET_TOURNAMENT' }
   | { type: 'CHANGE_PLAYERS' }
   | { type: 'RETURN_TO_LOBBY' }
@@ -303,11 +307,14 @@ function handleMessage(socket: WebSocket, message: ClientMessage): void {
       requireHost(player);
       startRound(room);
       break;
+    case 'FREE_THROW_READY':
+      handleFreeThrowReady(room, player, message.matchId, message.turnId);
+      break;
     case 'SHOT':
-      handleHumanShot(room, player, message.matchId, message.direction, message.power);
+      handleHumanShot(room, player, message.matchId, message.turnId, message.direction, message.power, message.releasedAt);
       break;
     case 'DISTRACT':
-      handleDistraction(room, player, message.matchId, message.distractionType);
+      handleDistraction(room, player, message.matchId, message.turnId, message.distractionType);
       break;
     case 'RESET_TOURNAMENT':
     case 'RETURN_TO_LOBBY':
@@ -477,6 +484,12 @@ function startRound(room: Room): void {
     match.shotInFlight = false;
     match.lastShot = undefined;
     match.turnReadyAt = undefined;
+    match.awaitingShooterReady = false;
+    match.turnReadyFallbackAt = undefined;
+    match.turnStartedAt = undefined;
+    match.turnDeadlineAt = undefined;
+    match.distractionWindowClosesAt = undefined;
+    match.turnId = undefined;
     match.autoShotScheduled = false;
     assignFlopMoment(match);
   }
@@ -498,16 +511,76 @@ function advanceToFreeThrow(room: Room, match: Match): void {
   match.phaseDeadlineAt = undefined;
   match.shotInFlight = false;
   match.distraction = undefined;
-  prepareFreeThrowTurn(room, match);
+  queueFreeThrowTurn(room, match);
 }
 
-function prepareFreeThrowTurn(room: Room, match: Match): void {
+function queueFreeThrowTurn(room: Room, match: Match): void {
   if (room.status !== 'ACTIVE' || match.phase !== 'FREE_THROW' || match.shotInFlight) return;
 
-  match.phaseDeadlineAt = undefined;
-  const now = Date.now();
   const turnId = randomUUID();
+  match.phaseDeadlineAt = undefined;
   match.turnId = turnId;
+  match.awaitingShooterReady = true;
+  match.turnReadyFallbackAt = undefined;
+  match.turnStartedAt = undefined;
+  match.turnDeadlineAt = undefined;
+  match.distractionWindowClosesAt = undefined;
+  match.turnReadyAt = undefined;
+  match.autoShotScheduled = false;
+  match.distraction = undefined;
+  match.distractionUsedByPlayerId = undefined;
+  match.meterFirstPerfectAt = undefined;
+  match.meterSecondPerfectAt = undefined;
+  match.meterDirectionHalfCycles = undefined;
+  match.meterPowerHalfCycles = undefined;
+  match.meterDirectionSign = undefined;
+  match.meterPowerSign = undefined;
+
+  // Bots and disconnected players do not need a browser-ready acknowledgement.
+  if (isAutomated(room, match.activeShooterId)) {
+    activateFreeThrowTurn(room, match, turnId);
+    return;
+  }
+
+  // Broadcast the free-throw scene first. The active human confirms that their
+  // scene is visible, then the full 10-second clock begins. This prevents long
+  // flop commentary, slow devices or network delay from reducing the clock to
+  // seven seconds before the player can interact.
+  match.turnReadyFallbackAt = Date.now() + HUMAN_TURN_READY_FALLBACK_MS;
+  broadcast(room);
+  schedule(room, match, HUMAN_TURN_READY_FALLBACK_MS, () => {
+    if (
+      room.status !== 'ACTIVE' ||
+      match.phase !== 'FREE_THROW' ||
+      match.shotInFlight ||
+      match.turnId !== turnId ||
+      !match.awaitingShooterReady
+    ) return;
+    console.warn(`Free-throw ready acknowledgement timed out for ${room.code}/${match.id}; starting the clock safely.`);
+    activateFreeThrowTurn(room, match, turnId);
+  });
+}
+
+function handleFreeThrowReady(room: Room, player: Player, matchId: string, turnId: string): void {
+  const match = room.matches.find((candidate) => candidate.id === matchId);
+  if (!match || room.status !== 'ACTIVE' || match.phase !== 'FREE_THROW' || match.shotInFlight) return;
+  if (match.activeShooterId !== player.id) return;
+  if (!turnId || match.turnId !== turnId || !match.awaitingShooterReady) return;
+  activateFreeThrowTurn(room, match, turnId);
+}
+
+function activateFreeThrowTurn(room: Room, match: Match, turnId: string): void {
+  if (
+    room.status !== 'ACTIVE' ||
+    match.phase !== 'FREE_THROW' ||
+    match.shotInFlight ||
+    match.turnId !== turnId ||
+    !match.awaitingShooterReady
+  ) return;
+
+  const now = Date.now();
+  match.awaitingShooterReady = false;
+  match.turnReadyFallbackAt = undefined;
   match.turnStartedAt = now;
   match.turnDeadlineAt = now + SHOT_CLOCK_MS;
   match.distractionWindowClosesAt = now + DISTRACTION_WINDOW_MS;
@@ -538,10 +611,6 @@ function prepareFreeThrowTurn(room: Room, match: Match): void {
     const defenderId = match.activeShooterId === match.playerAId ? match.playerBId : match.playerAId;
     const humanDefender = !isAutomated(room, defenderId);
     const allAutomated = isAutomated(room, match.playerAId) && isAutomated(room, match.playerBId);
-    // Bots use the same two visible timing windows as human players, but no
-    // longer make nearly every attempt. Their planned accuracy begins around
-    // two-thirds and falls slightly as the clutch green zone tightens. This
-    // creates more natural misses and makes long 10+ point deuce battles rarer.
     const minDelay = humanDefender ? 2300 : allAutomated ? 2100 : 2250;
     const maxDelay = 9300;
     const pressureLevel = meterPressureLevel(match);
@@ -569,13 +638,33 @@ function prepareFreeThrowTurn(room: Room, match: Match): void {
   broadcast(room);
 }
 
-function handleHumanShot(room: Room, player: Player, matchId: string, rawDirection: number, rawPower: number): void {
+function handleHumanShot(
+  room: Room,
+  player: Player,
+  matchId: string,
+  submittedTurnId: string | undefined,
+  rawDirection: number,
+  rawPower: number,
+  rawReleasedAt?: number,
+): void {
   const match = room.matches.find((candidate) => candidate.id === matchId);
   if (!match || room.status !== 'ACTIVE' || match.phase !== 'FREE_THROW') throw new Error('That free throw is no longer active.');
   if (match.shotInFlight) throw new Error('The basketball is already in the air.');
+  if (match.awaitingShooterReady || match.turnDeadlineAt === undefined) throw new Error('The 10-second shot clock is still getting ready.');
   if (match.activeShooterId !== player.id) throw new Error('It is not your turn to shoot.');
+  if (submittedTurnId && submittedTurnId !== match.turnId) throw new Error('That free-throw turn has already changed.');
+
+  // The exact marker values visible to the shooter remain authoritative. The
+  // optional release timestamp is used only to diagnose large clock drift; it
+  // never changes a fair human release after the player presses SHOOT.
   const direction = clampNumber(rawDirection);
   const power = clampNumber(rawPower);
+  if (rawReleasedAt !== undefined && Number.isFinite(rawReleasedAt) && match.turnStartedAt !== undefined && match.turnDeadlineAt !== undefined) {
+    const releasedAt = Math.max(match.turnStartedAt, Math.min(match.turnDeadlineAt, Number(rawReleasedAt)));
+    const expected = calculateMeterValues(match, releasedAt);
+    const drift = Math.max(Math.abs(expected.direction - direction), Math.abs(expected.power - power));
+    if (drift > 0.18) console.warn(`Large meter clock drift (${drift.toFixed(3)}) for ${room.code}/${match.id}.`);
+  }
   resolveShot(room, match, direction, power);
 }
 
@@ -636,6 +725,8 @@ function resolveShot(room: Room, match: Match, direction: number, power: number)
   match.phaseDeadlineAt = Date.now() + SHOT_FLIGHT_WATCHDOG_GRACE_MS;
   match.autoShotScheduled = false;
   match.turnReadyAt = undefined;
+  match.awaitingShooterReady = false;
+  match.turnReadyFallbackAt = undefined;
   match.turnStartedAt = undefined;
   match.turnDeadlineAt = undefined;
   match.distractionWindowClosesAt = undefined;
@@ -696,7 +787,7 @@ function finishResolvedShot(room: Room, match: Match): void {
   }
 
   if (match.attemptsRemaining > 0) {
-    prepareFreeThrowTurn(room, match);
+    queueFreeThrowTurn(room, match);
     return;
   }
 
@@ -717,13 +808,15 @@ function finishResolvedShot(room: Room, match: Match): void {
 
   match.attemptsRemaining = 1;
   match.phase = 'FREE_THROW';
-  prepareFreeThrowTurn(room, match);
+  queueFreeThrowTurn(room, match);
 }
 
-function handleDistraction(room: Room, player: Player, matchId: string, rawType: string): void {
+function handleDistraction(room: Room, player: Player, matchId: string, submittedTurnId: string | undefined, rawType: string): void {
   const match = room.matches.find((candidate) => candidate.id === matchId);
   if (!match || room.status !== 'ACTIVE' || match.phase !== 'FREE_THROW') throw new Error('That matchup is not accepting distractions.');
   if (match.shotInFlight) throw new Error('Too late — the basketball is already in the air.');
+  if (match.awaitingShooterReady || match.turnDeadlineAt === undefined) throw new Error('Wait for the 10-second shot clock to begin.');
+  if (submittedTurnId && submittedTurnId !== match.turnId) throw new Error('That free-throw turn has already changed.');
   const defenderId = match.activeShooterId === match.playerAId ? match.playerBId : match.playerAId;
   if (player.id !== defenderId) throw new Error('Only the defending player can distract the shooter.');
   if (match.distractionUsedByPlayerId === player.id) throw new Error('You already used your distraction for this free throw.');
@@ -779,6 +872,8 @@ function completeMatch(room: Room, match: Match, winnerId: string): void {
   match.shotInFlight = false;
   match.autoShotScheduled = false;
   match.turnReadyAt = undefined;
+  match.awaitingShooterReady = false;
+  match.turnReadyFallbackAt = undefined;
   match.turnStartedAt = undefined;
   match.turnDeadlineAt = undefined;
   match.distractionWindowClosesAt = undefined;
@@ -853,7 +948,7 @@ function repairCompletedWinner(room: Room, match: Match): boolean {
     ? match.activeShooterId
     : match.playerAId;
   room.roundAdvanceAt = undefined;
-  prepareFreeThrowTurn(room, match);
+  queueFreeThrowTurn(room, match);
   return false;
 }
 
@@ -970,7 +1065,7 @@ function handleDisconnect(socket: WebSocket): void {
   }
   if (room.status === 'ACTIVE') {
     const match = currentMatches(room).find((candidate) => candidate.phase === 'FREE_THROW' && candidate.activeShooterId === player.id);
-    if (match) prepareFreeThrowTurn(room, match);
+    if (match) queueFreeThrowTurn(room, match);
   }
   broadcast(room);
   if (player.isHost && room.status === 'SETUP' && room.players.filter((candidate) => !candidate.isBot && candidate.connected).length === 0) {
@@ -1224,9 +1319,20 @@ function runMatchWatchdog(): void {
           continue;
         }
 
+        if (match.awaitingShooterReady) {
+          if (match.turnId === undefined) {
+            console.warn(`Watchdog rebuilt missing free-throw ready state ${room.code}/${match.id}.`);
+            queueFreeThrowTurn(room, match);
+          } else if (match.turnReadyFallbackAt !== undefined && now >= match.turnReadyFallbackAt + FREE_THROW_WATCHDOG_GRACE_MS) {
+            console.warn(`Watchdog started an overdue ready-waiting free throw ${room.code}/${match.id}.`);
+            activateFreeThrowTurn(room, match, match.turnId);
+          }
+          continue;
+        }
+
         if (match.turnDeadlineAt === undefined || match.turnId === undefined) {
           console.warn(`Watchdog rebuilt missing free-throw turn ${room.code}/${match.id}.`);
-          prepareFreeThrowTurn(room, match);
+          queueFreeThrowTurn(room, match);
           continue;
         }
 
@@ -1317,9 +1423,10 @@ function sendError(socket: WebSocket, message: string): void {
   send(socket, { type: 'ERROR', message });
 }
 
-function serializeRoom(room: Room): Room {
+function serializeRoom(room: Room): Room & { serverNow: number } {
   return {
     ...room,
+    serverNow: Date.now(),
     players: room.players.map((player) => ({ ...player })),
     matches: room.matches.map(({ lastDistractionAt: _hidden, autoShotScheduled: _autoHidden, lastMadeAudioKey: _madeHidden, lastMissAudioKey: _missHidden, ...match }) => ({ ...match })),
     currentRoundMatchIds: [...room.currentRoundMatchIds],

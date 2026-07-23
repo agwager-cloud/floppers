@@ -51,6 +51,8 @@ class NetworkService {
   private connectionProgressListeners = new Set<ConnectionProgressListener>();
   private reconnecting = false;
   private connectionGeneration = 0;
+  private serverClockOffsetMs = 0;
+  private hasServerClock = false;
 
   async hostRoom(name: string): Promise<void> {
     const requestId = makeRequestId();
@@ -95,6 +97,11 @@ class NetworkService {
     return () => this.connectionProgressListeners.delete(listener);
   }
 
+
+  serverNow(): number {
+    return Date.now() + this.serverClockOffsetMs;
+  }
+
   isUsingPublishedServer(): boolean {
     return !isPrivateLanHost(window.location.hostname || 'localhost');
   }
@@ -108,7 +115,7 @@ class NetworkService {
   }
 
   private getWebSocketUrl(): string {
-    const explicitUrl = (import.meta.env.VITE_WS_URL as string | undefined)?.trim();
+    const explicitUrl = (import.meta as ImportMeta & { env?: { VITE_WS_URL?: string } }).env?.VITE_WS_URL?.trim();
     if (explicitUrl) return explicitUrl.replace(/\/$/, '');
 
     const host = window.location.hostname || 'localhost';
@@ -369,6 +376,7 @@ class NetworkService {
 
   private handleServerMessage(message: ServerMessage): void {
     if (message.type === 'WELCOME') {
+      this.syncServerClock(message.room.serverNow);
       this.reconnecting = false;
       this.emitConnectionStatus('');
       gameSession.playerId = message.playerId;
@@ -376,11 +384,27 @@ class NetworkService {
       this.welcomeListeners.forEach((listener) => listener());
       this.stateListeners.forEach((listener) => listener(message.room));
     } else if (message.type === 'ROOM_STATE') {
+      this.syncServerClock(message.room.serverNow);
       gameSession.room = message.room;
       this.stateListeners.forEach((listener) => listener(message.room));
     } else if (message.type === 'ERROR') {
       this.emitError(message.message);
     }
+  }
+
+  private syncServerClock(serverNow?: number): void {
+    if (!Number.isFinite(serverNow)) return;
+    const sample = Number(serverNow) - Date.now();
+    if (!this.hasServerClock) {
+      this.serverClockOffsetMs = sample;
+      this.hasServerClock = true;
+      return;
+    }
+
+    // Smooth small network-latency variations while still correcting a device
+    // clock that is seconds ahead or behind the server. All free-throw meters,
+    // shot clocks and distraction windows use this shared clock.
+    this.serverClockOffsetMs = this.serverClockOffsetMs * 0.7 + sample * 0.3;
   }
 
   private closeCurrentSocket(): void {

@@ -59,6 +59,8 @@ export class FreeThrowScene extends Phaser.Scene {
   private lastDistractionSignature = '';
   private localDistractionUsed = false;
   private turnId = '';
+  private awaitingShooterReady = false;
+  private readySentForTurnId = '';
   private distractionUseSignature = '';
   private keyboardShoot?: Phaser.Input.Keyboard.Key;
   private restartQueued = false;
@@ -82,6 +84,8 @@ export class FreeThrowScene extends Phaser.Scene {
     this.lastDistractionSignature = '';
     this.localDistractionUsed = false;
     this.turnId = '';
+    this.awaitingShooterReady = false;
+    this.readySentForTurnId = '';
     this.distractionUseSignature = '';
     this.lastCountdownSecond = -1;
     this.keyboardShoot = undefined;
@@ -108,6 +112,7 @@ export class FreeThrowScene extends Phaser.Scene {
     this.stateSignature = this.makeSignature(match);
     this.shotLocked = match.shotInFlight;
     this.turnId = match.turnId ?? '';
+    this.awaitingShooterReady = Boolean(match.awaitingShooterReady);
     this.distractionUseSignature = match.distractionUsedByPlayerId ?? '';
     this.localDistractionUsed = match.distractionUsedByPlayerId === gameSession.playerId;
 
@@ -125,7 +130,9 @@ export class FreeThrowScene extends Phaser.Scene {
 
     this.drawCrossMeter(match);
     if (!match.shotInFlight) {
-      const values = this.calculateMeterValues(match, Date.now());
+      const values = match.awaitingShooterReady
+        ? { direction: 0.5, power: 0.5 }
+        : this.calculateMeterValues(match, network.serverNow());
       this.directionValue = values.direction;
       this.powerValue = values.power;
       this.positionMeterBalls();
@@ -152,6 +159,8 @@ export class FreeThrowScene extends Phaser.Scene {
     }));
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.cleanup());
 
+    this.time.delayedCall(0, () => this.requestFreeThrowReady(match));
+
     if (match.lastShot && match.shotInFlight) {
       this.directionValue = match.lastShot.direction;
       this.powerValue = match.lastShot.power;
@@ -168,17 +177,27 @@ export class FreeThrowScene extends Phaser.Scene {
     const shooter = room.players.find((player) => player.id === match.activeShooterId);
     const shooterIsAutomated = !shooter || shooter.isBot || !shooter.connected;
 
+    if (match.awaitingShooterReady) {
+      this.directionValue = 0.5;
+      this.powerValue = 0.5;
+      this.positionMeterBalls();
+      this.requestFreeThrowReady(match);
+      this.updateShotClock(match);
+      this.updateDistractionWindow(match);
+      return;
+    }
+
     if (!match.shotInFlight && !this.shotLocked) {
       // When a bot reaches its scheduled release moment, freeze the markers at
       // that exact server-authoritative point so the shot looks smooth instead
       // of jumping from a miss into the green zone when the network update lands.
-      if (shooterIsAutomated && match.turnReadyAt && Date.now() >= match.turnReadyAt) {
+      if (shooterIsAutomated && match.turnReadyAt && network.serverNow() >= match.turnReadyAt) {
         const values = this.calculateMeterValues(match, match.turnReadyAt);
         this.directionValue = values.direction;
         this.powerValue = values.power;
         this.shotLocked = true;
       } else {
-        const values = this.calculateMeterValues(match, Date.now());
+        const values = this.calculateMeterValues(match, network.serverNow());
         this.directionValue = values.direction;
         this.powerValue = values.power;
       }
@@ -280,9 +299,10 @@ export class FreeThrowScene extends Phaser.Scene {
     const defenderId = match.activeShooterId === match.playerAId ? match.playerBId : match.playerAId;
     const isDefender = defenderId === gameSession.playerId;
     const shooter = room.players.find((player) => player.id === match.activeShooterId);
+    const turnActive = !match.awaitingShooterReady && match.turnDeadlineAt !== undefined;
     const distractionUsed = match.distractionUsedByPlayerId === gameSession.playerId || this.localDistractionUsed;
-    const distractionWindowOpen = Date.now() < (match.distractionWindowClosesAt ?? 0);
-    const distractionDisabled = distractionUsed || !distractionWindowOpen;
+    const distractionWindowOpen = network.serverNow() < (match.distractionWindowClosesAt ?? 0);
+    const distractionDisabled = !turnActive || distractionUsed || !distractionWindowOpen;
 
     addPanel(this, 190, 500, 315, 260, 0.93);
 
@@ -295,12 +315,20 @@ export class FreeThrowScene extends Phaser.Scene {
     }
 
     if (isShooter) {
-      this.add.text(190, 406, 'YOU ARE SHOOTING', { fontFamily: 'Arial Black, Arial', fontSize: '21px', color: '#67f2a8' }).setOrigin(0.5);
-      this.add.text(190, 467, 'Time the two moving basketballs so they overlap in the green centre of the cross before the shot clock expires.', {
+      this.add.text(190, 406, turnActive ? 'YOU ARE SHOOTING' : 'GET READY TO SHOOT', {
+        fontFamily: 'Arial Black, Arial', fontSize: '21px', color: '#67f2a8',
+      }).setOrigin(0.5);
+      this.add.text(190, 467, turnActive
+        ? 'Time the two moving basketballs so they overlap in the green centre of the cross before the shot clock expires.'
+        : 'The shot clock will begin at a full 10 seconds as soon as this screen is ready.', {
         fontSize: '15px', color: '#ffffff', align: 'center', wordWrap: { width: 270 }, lineSpacing: 5,
       }).setOrigin(0.5);
-      addButton(this, 190, 570, 245, 62, 'SHOOT!', () => this.attemptShot(), { fill: COLORS.gold, fontSize: 27 });
-      this.add.text(190, 620, 'Touch SHOOT or press SPACE', { fontSize: '12px', color: '#cbd4ff' }).setOrigin(0.5);
+      addButton(this, 190, 570, 245, 62, turnActive ? 'SHOOT!' : 'GET READY…', () => this.attemptShot(), {
+        fill: COLORS.gold, fontSize: turnActive ? 27 : 20, disabled: !turnActive,
+      });
+      this.add.text(190, 620, turnActive ? 'Touch SHOOT or press SPACE' : 'Clock synchronising with the classroom server', {
+        fontSize: '12px', color: '#cbd4ff',
+      }).setOrigin(0.5);
     } else if (isDefender) {
       this.add.text(190, 385, 'DISTRACT THE SHOOTER', { fontFamily: 'Arial Black, Arial', fontSize: '18px', color: '#ff9aab' }).setOrigin(0.5);
       this.add.text(190, 414, `${shooter?.name ?? 'The opponent'} is lining up the shot. Choose only one distraction.`, {
@@ -350,7 +378,7 @@ export class FreeThrowScene extends Phaser.Scene {
 
   private attemptShot(): void {
     const match = gameSession.room?.matches.find((candidate) => candidate.id === this.matchId);
-    if (!match || match.phase !== 'FREE_THROW' || match.activeShooterId !== gameSession.playerId || match.shotInFlight || this.shotLocked) return;
+    if (!match || match.phase !== 'FREE_THROW' || match.activeShooterId !== gameSession.playerId || match.shotInFlight || this.shotLocked || match.awaitingShooterReady || match.turnDeadlineAt === undefined) return;
 
     // Freeze the meter at the exact positions the player can currently see.
     // The server receives this same snapshot, so the markers never jump to a
@@ -376,7 +404,14 @@ export class FreeThrowScene extends Phaser.Scene {
       ease: 'Sine.Out',
     });
 
-    network.send({ type: 'SHOT', matchId: match.id, direction: releaseDirection, power: releasePower });
+    network.send({
+      type: 'SHOT',
+      matchId: match.id,
+      turnId: match.turnId,
+      direction: releaseDirection,
+      power: releasePower,
+      releasedAt: network.serverNow(),
+    });
   }
 
   private distract(distractionType: string): void {
@@ -390,11 +425,15 @@ export class FreeThrowScene extends Phaser.Scene {
       this.queueRestart();
       return;
     }
+    if (match.awaitingShooterReady || match.turnDeadlineAt === undefined) {
+      showToast(this, 'Wait for the 10-second shot clock to begin.');
+      return;
+    }
     if (match.shotInFlight) {
       showToast(this, 'Too late — the basketball is already in the air.');
       return;
     }
-    if (Date.now() >= (match.distractionWindowClosesAt ?? 0)) {
+    if (network.serverNow() >= (match.distractionWindowClosesAt ?? 0)) {
       showToast(this, 'Distraction window closed — the shooter gets the final four seconds undisturbed.', COLORS.blue);
       this.updateDistractionWindow(match);
       return;
@@ -404,7 +443,7 @@ export class FreeThrowScene extends Phaser.Scene {
       return;
     }
     this.localDistractionUsed = true;
-    network.send({ type: 'DISTRACT', matchId: match.id, distractionType });
+    network.send({ type: 'DISTRACT', matchId: match.id, turnId: match.turnId, distractionType });
   }
 
   private handleState(room: RoomState): void {
@@ -425,16 +464,18 @@ export class FreeThrowScene extends Phaser.Scene {
     const nextDistractionUse = match.distractionUsedByPlayerId ?? '';
     const defenderId = match.activeShooterId === match.playerAId ? match.playerBId : match.playerAId;
     const turnChanged = Boolean(this.turnId && nextTurnId && nextTurnId !== this.turnId);
+    const readyStateChanged = this.awaitingShooterReady !== Boolean(match.awaitingShooterReady);
     const roleChanged = match.activeShooterId !== this.shooterId;
     const defenderControlsChanged = defenderId === gameSession.playerId && nextDistractionUse !== this.distractionUseSignature;
 
-    if (!this.animationPlaying && !match.shotInFlight && (turnChanged || roleChanged)) {
+    if (!this.animationPlaying && !match.shotInFlight && (turnChanged || roleChanged || readyStateChanged)) {
       this.queueRestart();
       return;
     }
 
     this.stateSignature = nextSignature;
     this.turnId = nextTurnId;
+    this.awaitingShooterReady = Boolean(match.awaitingShooterReady);
     this.distractionUseSignature = nextDistractionUse;
     this.localDistractionUsed = nextDistractionUse === gameSession.playerId;
 
@@ -456,7 +497,7 @@ export class FreeThrowScene extends Phaser.Scene {
     this.refreshScoreCards(match, room);
     this.updateShotClock(match);
 
-    if (match.distraction && match.distraction.expiresAt > Date.now()) {
+    if (match.distraction && match.distraction.expiresAt > network.serverNow()) {
       const signature = `${match.distraction.byPlayerId}:${match.distraction.type}:${match.distraction.expiresAt}`;
       if (signature !== this.lastDistractionSignature) {
         this.lastDistractionSignature = signature;
@@ -472,8 +513,8 @@ export class FreeThrowScene extends Phaser.Scene {
         // including the shooter, defender and spectators. That makes the effect
         // obvious and keeps all viewers visually in sync.
         if (match.distraction.type === 'BAD DANCE') {
-          const startDelay = Math.max(0, (match.distraction.startedAt ?? Date.now()) - Date.now());
-          const duration = Math.max(500, (match.distraction.expiresAt ?? Date.now() + 500) - Math.max(Date.now(), match.distraction.startedAt ?? Date.now()));
+          const startDelay = Math.max(0, (match.distraction.startedAt ?? network.serverNow()) - network.serverNow());
+          const duration = Math.max(500, (match.distraction.expiresAt ?? network.serverNow() + 500) - Math.max(network.serverNow(), match.distraction.startedAt ?? network.serverNow()));
           this.time.delayedCall(startDelay, () => {
             if (this.scene.isActive()) this.cameras.main.shake(duration, 0.0038, true);
           });
@@ -483,9 +524,16 @@ export class FreeThrowScene extends Phaser.Scene {
 
     if (match.lastShot && match.shotInFlight && match.lastShot.id !== this.lastAnimatedShotId) {
       this.shotLocked = true;
-      // Keep the meter exactly where it was visually released. Moving the
-      // markers to the server result here caused the noticeable last-moment
-      // jump reported by human shooters.
+      // The shooter keeps the exact locally frozen release to avoid a visual
+      // jump. Opponents and spectators did not press SHOOT, so freeze their
+      // markers at the server-confirmed release values before the ball flies.
+      // This makes the visible green overlap and the scored result identical
+      // for every person watching the matchup.
+      if (match.lastShot.shooterId !== gameSession.playerId) {
+        this.directionValue = match.lastShot.direction;
+        this.powerValue = match.lastShot.power;
+        this.positionMeterBalls();
+      }
       this.animateShot(match.lastShot);
       return;
     }
@@ -498,6 +546,17 @@ export class FreeThrowScene extends Phaser.Scene {
     if (match.activeShooterId !== this.shooterId || (!match.shotInFlight && this.shotLocked)) {
       this.queueRestart();
     }
+  }
+
+  private requestFreeThrowReady(match: MatchState): void {
+    if (
+      !match.awaitingShooterReady ||
+      match.activeShooterId !== gameSession.playerId ||
+      !match.turnId ||
+      this.readySentForTurnId === match.turnId
+    ) return;
+    this.readySentForTurnId = match.turnId;
+    network.send({ type: 'FREE_THROW_READY', matchId: match.id, turnId: match.turnId });
   }
 
   private calculateMeterValues(match: MatchState, at: number): { direction: number; power: number } {
@@ -555,7 +614,7 @@ export class FreeThrowScene extends Phaser.Scene {
   private updateDistractionVisuals(match: MatchState): void {
     if (!this.directionBall || !this.powerBall) return;
     const distraction = match.distraction;
-    const active = distraction && Date.now() >= distraction.startedAt && distraction.expiresAt > Date.now();
+    const active = distraction && network.serverNow() >= distraction.startedAt && distraction.expiresAt > network.serverNow();
     if (active && distraction.type === 'SQUEAKY SHOES') {
       this.directionBall.setAlpha(0);
       this.powerBall.setAlpha(0);
@@ -566,11 +625,15 @@ export class FreeThrowScene extends Phaser.Scene {
   }
 
   private updateDistractionWindow(match: MatchState): void {
+    if (match.awaitingShooterReady || match.turnDeadlineAt === undefined) {
+      this.fairnessText?.setText('GET READY • CLOCK STARTS AT 10').setColor('#67f2a8');
+      return;
+    }
     if (match.shotInFlight || this.shotLocked) {
       this.fairnessText?.setText(match.shotInFlight ? 'SHOT IN FLIGHT' : 'RELEASE LOCKED').setColor('#ffffff');
       return;
     }
-    const remainingMs = Math.max(0, (match.distractionWindowClosesAt ?? 0) - Date.now());
+    const remainingMs = Math.max(0, (match.distractionWindowClosesAt ?? 0) - network.serverNow());
     const open = remainingMs > 0;
     const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
     this.fairnessText
@@ -589,13 +652,18 @@ export class FreeThrowScene extends Phaser.Scene {
 
   private updateShotClock(match: MatchState): void {
     if (!this.countdownText?.active) return;
+    if (match.awaitingShooterReady || match.turnDeadlineAt === undefined) {
+      this.countdownText.setText('SHOT CLOCK 10').setColor('#67f2a8').setScale(1);
+      this.lastCountdownSecond = 10;
+      return;
+    }
     if (match.shotInFlight || this.shotLocked) {
       this.countdownText.setText('SHOT AWAY').setColor('#ffffff').setScale(1);
       this.lastCountdownSecond = -1;
       return;
     }
 
-    const remainingMs = Math.max(0, (match.turnDeadlineAt ?? Date.now()) - Date.now());
+    const remainingMs = Math.max(0, (match.turnDeadlineAt ?? network.serverNow()) - network.serverNow());
     const seconds = Math.max(0, Math.ceil(remainingMs / 1000));
     const colour = seconds <= 1 ? '#ff4d67' : seconds === 2 ? '#ff922b' : seconds === 3 ? '#fff04a' : '#67f2a8';
     this.countdownText.setText(`SHOT CLOCK ${seconds}`).setColor(colour);
@@ -790,6 +858,7 @@ export class FreeThrowScene extends Phaser.Scene {
       match.shotInFlight,
       match.lastShot?.id,
       match.turnId,
+      match.awaitingShooterReady,
       match.turnDeadlineAt,
       match.meterFirstPerfectAt,
       match.meterSecondPerfectAt,
@@ -814,6 +883,8 @@ export class FreeThrowScene extends Phaser.Scene {
     this.distractionStatusText = undefined;
     this.distractionButtons = [];
     this.distractionWindowClosed = false;
+    this.awaitingShooterReady = false;
+    this.readySentForTurnId = '';
     this.directionBall = undefined;
     this.powerBall = undefined;
   }
